@@ -129,22 +129,35 @@ if result.returncode == 0:
         await this.ensureSandbox()
 
         try {
+          // Handle path resolution - if path is '.' use workDir, otherwise join with workDir
+          const targetPath = path === '.' ? this.workDir : `${this.workDir}/${path}`
+          
           const code = `
 import os
+import sys
 
 def list_files(startpath):
-    files = []
-    for root, dirs, filenames in os.walk(startpath):
-        for f in filenames:
-            full_path = os.path.join(root, f)
-            # Make path relative to startpath
-            rel_path = os.path.relpath(full_path, startpath)
-            files.append(rel_path)
+    # Use stderr for logging to keep stdout clean for file paths
+    print(f"LISTING_PATH: {startpath}", file=sys.stderr)
+    if not os.path.exists(startpath):
+        print(f"ERROR: Path does not exist: {startpath}", file=sys.stderr)
+        return
     
+    files = []
+    if os.path.isfile(startpath):
+        files.append(os.path.basename(startpath))
+    else:
+        for root, dirs, filenames in os.walk(startpath):
+            for f in filenames:
+                full_path = os.path.join(root, f)
+                rel_path = os.path.relpath(full_path, startpath)
+                files.append(rel_path)
+    
+    print(f"FILES_COUNT: {len(files)}", file=sys.stderr)
     for f in files:
-        print(f)
+        print(f) # Print actual file paths to stdout
 
-list_files('${this.workDir}')
+list_files('${targetPath}')
 `
           const result = await this.sandbox!.runCode(code)
           const files = result.logs.stdout
@@ -153,10 +166,10 @@ list_files('${this.workDir}')
             .filter(line => line.trim() !== '') // Remove empty lines
             .map(p => ({
               path: p.trim(),
-              size: 0, // E2B doesn't easily provide file size with ls, will implement later
+              size: 0, // E2B doesn't easily provide file size with ls
             }))
 
-          console.log('[E2B] list_files raw output:', result.logs.stdout)
+          console.log('[E2B] list_files diagnostics:', result.logs.stderr.join('\n'))
           console.log('[E2B] list_files processed files:', files.length, 'files found')
           console.log('[E2B] Sample files:', files.slice(0, 5).map(f => f.path))
 
@@ -192,49 +205,69 @@ list_files('${this.workDir}')
       },
       execute: async (params) => {
         const startTime = Date.now()
-        const { path } = params as ToolParameters['read_file']
+        const { path: relativePath } = params as ToolParameters['read_file']
         await this.ensureSandbox()
 
         try {
-          const result = await this.sandbox!.runCode(`
+          // Ensure path is relative to the workspace root
+          const fullPath = relativePath.startsWith('/') 
+            ? relativePath 
+            : `${this.workDir}/${relativePath}`
+
+          const code = `
 import os
-print("CURRENT_DIR:", os.getcwd())
-print("WORK_DIR_EXISTS:", os.path.exists('${this.workDir}'))
+import sys
 
-file_path = '${path}'
-print("READING_FILE:", file_path)
-print("FILE_EXISTS:", os.path.exists(file_path))
+file_path = '${fullPath}'
+# All logging goes to stderr
+print(f"Attempting to read: {file_path}", file=sys.stderr)
 
-if os.path.exists(file_path):
-    try:
-        with open(file_path, 'r', encoding='utf-8') as file:
-            content = file.read()
-            print("FILE_SIZE:", len(content))
-            print("CONTENT_PREVIEW:", content[:100] if content else "EMPTY")
-            print("CONTENT_START")
-            print(content)
-            print("CONTENT_END")
-    except Exception as e:
-        print("READ_ERROR:", str(e))
-        print("CONTENT_START")
-        print("CONTENT_END")
+if not os.path.exists(file_path):
+    print(f"Error: File not found at {file_path}", file=sys.stderr)
+    # Signal non-existence via stdout for the calling function to check
+    print("FILE_NOT_FOUND") 
 else:
-    print("FILE_NOT_FOUND")
-    print("CONTENT_START")
-    print("CONTENT_END")
-`)
-          if (result.logs.stderr.length > 0) {
-            throw new Error(result.logs.stderr.join('\\n'))
+    try:
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            # The actual file content is the only thing printed to stdout
+            sys.stdout.write(f.read())
+    except Exception as e:
+        print(f"Error reading file: {str(e)}", file=sys.stderr)
+        # Signal a read error via stdout
+        print("FILE_READ_ERROR")
+`
+          const result = await this.sandbox!.runCode(code)
+          const stdout = result.logs.stdout.join('\\n')
+          
+          console.log(`[E2B] read_file diagnostics for ${fullPath}:`, result.logs.stderr.join('\\n'))
+
+          if (stdout.trim() === 'FILE_NOT_FOUND') {
+            return {
+              success: false,
+              error: `File not found: ${relativePath}`,
+              toolName: 'read_file',
+              executionTime: Date.now() - startTime,
+            }
           }
-          const content = result.logs.stdout.join('\\n')
+          
+          if (stdout.trim() === 'FILE_READ_ERROR') {
+            return {
+              success: false,
+              error: `Failed to read file content for: ${relativePath}`,
+              toolName: 'read_file',
+              executionTime: Date.now() - startTime,
+            }
+          }
+
           return {
             success: true,
-            data: { content },
-            stdout: `Successfully read file: ${path}`,
+            data: { content: stdout },
+            stdout: `Successfully read file: ${relativePath}`,
             toolName: 'read_file',
             executionTime: Date.now() - startTime,
           }
         } catch (error: any) {
+          console.error(`[E2B] Critical error in read_file for ${relativePath}:`, error)
           return {
             success: false,
             error: `Failed to read file: ${error.message}`,
@@ -259,63 +292,54 @@ else:
       },
       execute: async (params) => {
         const startTime = Date.now()
-        const { path, content } = params as ToolParameters['write_file']
+        const { path: relativePath, content } = params as ToolParameters['write_file']
         await this.ensureSandbox()
 
         try {
-          const fullPath = path.startsWith('/') ? path : `${this.workDir}/${path}`
-          console.log('[E2B] Writing to file at full path:', fullPath)
+          const fullPath = relativePath.startsWith('/') ? relativePath : `${this.workDir}/${relativePath}`
           
           // Escape the content properly for Python triple quotes
           const escapedContent = content.replace(/\\/g, '\\\\').replace(/"""/g, '\\"""')
           
-          const result = await this.sandbox!.runCode(`
+          const code = `
 import os
+import sys
 
 file_path = '${fullPath}'
-print("CURRENT_DIR:", os.getcwd())
-print("WORK_DIR_EXISTS:", os.path.exists('${this.workDir}'))
-print("WRITING_TO:", file_path)
+print(f"Attempting to write to: {file_path}", file=sys.stderr)
 
-# Create directory if it doesn't exist
 dir_path = os.path.dirname(file_path)
-print("DIR_PATH:", dir_path)
-print("DIR_EXISTS:", os.path.exists(dir_path))
-
 if not os.path.exists(dir_path):
     os.makedirs(dir_path, exist_ok=True)
-    print("CREATED_DIR:", dir_path)
+    print(f"Created directory: {dir_path}", file=sys.stderr)
 
 try:
     with open(file_path, 'w', encoding='utf-8') as file:
         file.write("""${escapedContent}""")
     print("WRITE_SUCCESS")
-    print("FILE_EXISTS_AFTER_WRITE:", os.path.exists(file_path))
-    
-    # Verify the write
-    with open(file_path, 'r', encoding='utf-8') as file:
-        written_content = file.read()
-        print("WRITTEN_SIZE:", len(written_content))
-        print("WRITTEN_PREVIEW:", written_content[:100] if written_content else "EMPTY")
 except Exception as e:
-    print("WRITE_ERROR:", str(e))
-`)
-          const stdout = result.logs.stdout.join('\n')
-          console.log('[E2B] Write file output:', stdout.slice(0, 500))
+    print(f"WRITE_ERROR: {str(e)}", file=sys.stderr)
+    print("WRITE_FAILURE")
+`
+          const result = await this.sandbox!.runCode(code)
+          const stdout = result.logs.stdout.join('\n').trim()
+          const stderr = result.logs.stderr.join('\n')
+
+          console.log(`[E2B] write_file diagnostics for ${fullPath}:`, stderr)
           
-          if (result.logs.stderr.length > 0) {
-            throw new Error(result.logs.stderr.join('\\n'))
+          if (stdout !== 'WRITE_SUCCESS') {
+            throw new Error(`Failed to write to file: ${stderr || 'Unknown error'}`)
           }
           
           return {
-            success: stdout.includes('WRITE_SUCCESS'),
-            stdout: stdout,
-            stderr: result.logs.stderr.join('\n'),
+            success: true,
+            stdout: `Successfully wrote to ${relativePath}`,
             data: { path: fullPath },
             toolName: 'write_file',
             executionTime: Date.now() - startTime,
           }
         } catch (error: any) {
+          console.error(`[E2B] Critical error in write_file for ${relativePath}:`, error)
           return {
             success: false,
             error: `Failed to write file: ${error.message}`,
@@ -350,12 +374,17 @@ except Exception as e:
                 const result = await this.sandbox!.runCode(`
 import subprocess
 import os
+import sys
 os.chdir('${targetDir}')
-subprocess.run(['git', 'add', '${filesToAdd}'], check=True)
+try:
+    subprocess.run(['git', 'add', '${filesToAdd}'], check=True)
+    print("SUCCESS")
+except subprocess.CalledProcessError as e:
+    print(str(e), file=sys.stderr)
                 `)
                 
-                if (result.logs.stderr.length > 0) {
-                    throw new Error(result.logs.stderr.join('\n'))
+                if (result.logs.stdout.join('').trim() !== 'SUCCESS') {
+                    throw new Error(result.logs.stderr.join('\\n') || 'git add command failed')
                 }
                 
                 return {
@@ -373,6 +402,95 @@ subprocess.run(['git', 'add', '${filesToAdd}'], check=True)
                 }
             }
         },
+    })
+    
+    this.tools.set('git_status', {
+      name: 'git_status',
+      description: 'Get Git repository status',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          repoPath: { type: 'string' }
+        },
+        required: ['repoPath']
+      },
+      execute: async (params) => {
+        const { repoPath } = params as { repoPath: string }
+        const startTime = Date.now()
+        
+        await this.ensureSandbox()
+
+        try {
+          const actualWorkDir = repoPath === '.' ? this.workDir : `${this.workDir}/${repoPath}`
+          
+          const code = `
+import subprocess
+import os
+
+os.chdir('${actualWorkDir}')
+print(f"WORKING_DIR: {os.getcwd()}")
+
+try:
+    result = subprocess.run(['git', 'status', '--porcelain'], 
+                          capture_output=True, text=True, cwd='${actualWorkDir}')
+    print(f"GIT_STATUS_RESULT: {result.returncode}")
+    if result.returncode == 0:
+        changes = [line for line in result.stdout.strip().split('\\n') if line.strip()]
+        print(f"CHANGES_COUNT: {len(changes)}")
+        print("CHANGES_OUTPUT:", result.stdout)
+        print(f"HAS_CHANGES: {len(changes) > 0}")
+        print(f"SUMMARY: {len(changes)} files changed")
+    else:
+        print(f"ERROR: {result.stderr}")
+        raise Exception(f"Git status failed: {result.stderr}")
+except Exception as e:
+    print(f"EXCEPTION: {str(e)}")
+    raise e
+`
+
+          const result = await this.sandbox!.runCode(code)
+          const output = result.logs.stdout.join('\n')
+          const error = result.logs.stderr.join('\n')
+
+          console.log('[E2B] git_status output:', output)
+          
+          if (output.includes('EXCEPTION:')) {
+            const errorMatch = output.match(/EXCEPTION: (.+)/)
+            throw new Error(errorMatch ? errorMatch[1] : 'Git status failed')
+          }
+
+          // Parse the output
+          const changesCountMatch = output.match(/CHANGES_COUNT: (\d+)/)
+          const hasChangesMatch = output.match(/HAS_CHANGES: (true|false)/)
+          const changesOutputMatch = output.match(/CHANGES_OUTPUT: ([\s\S]*?)(?=\n[A-Z_]+:|$)/)
+          
+          const changesCount = changesCountMatch ? parseInt(changesCountMatch[1]) : 0
+          const hasChanges = hasChangesMatch ? hasChangesMatch[1] === 'true' : false
+          const changesOutput = changesOutputMatch ? changesOutputMatch[1].trim() : ''
+          const changes = changesOutput ? changesOutput.split('\n').filter(line => line.trim()) : []
+
+          return {
+            success: true,
+            data: {
+              hasChanges,
+              changes,
+              summary: `${changesCount} files changed`
+            },
+            stdout: output,
+            stderr: error,
+            toolName: 'git_status',
+            executionTime: Date.now() - startTime
+          }
+        } catch (error: any) {
+          console.error('[E2B] git_status failed:', error)
+          return {
+            success: false,
+            error: `Git status failed: ${error.message}`,
+            toolName: 'git_status',
+            executionTime: Date.now() - startTime
+          }
+        }
+      }
     })
     
     this.tools.set('git_commit', {
@@ -698,6 +816,11 @@ except Exception as e:
 
   getAvailableTools(): string[] {
     return Array.from(this.tools.keys())
+  }
+  
+  getToolSchema(toolName: string): Record<string, any> | undefined {
+    const tool = this.tools.get(toolName)
+    return tool?.inputSchema
   }
   
   getWorkingDirectory(): string {

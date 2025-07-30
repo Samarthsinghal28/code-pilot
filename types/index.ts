@@ -18,6 +18,10 @@ export const EventTypes = [
   'tool_error',
   'debug',
   'ping',
+  'tool_call',
+  'file_change',
+  'progress',
+  'analysis_update'
 ]
 
 export type EventType = (typeof EventTypes)[number]
@@ -27,6 +31,13 @@ export interface StreamEvent {
   message: string
   data?: any
   timestamp: string
+  progress?: number // 0-100 for progress tracking
+  details?: {
+    tool?: string
+    file?: string
+    operation?: string
+    status?: 'started' | 'completed' | 'failed'
+  }
 }
 
 // Repository analysis types
