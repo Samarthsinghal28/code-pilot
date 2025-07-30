@@ -63,7 +63,13 @@ export interface RepositoryAnalysis {
   dependencies?: PackageInfo[];
   framework?: string;
   packageManager?: 'npm' | 'yarn' | 'pnpm' | 'bun';
-  projectRoot?: string; // Add this line
+  projectRoot?: string;
+  // New intelligent analysis fields
+  projectType?: string;
+  primaryLanguages?: string[];
+  backendFiles?: string[];
+  frontendFiles?: string[];
+  analysisNotes?: string;
 }
 
 // Implementation planning types

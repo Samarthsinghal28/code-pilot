@@ -17,6 +17,7 @@ import { OpenAIClient } from './llm/openai'
 import { createPullRequestFromRepo } from './github/api'
 import { get } from '@/lib/config/env'
 import * as path from 'path'
+import { githubAPI } from './github/api'
 
 export class McpAgent {
   private sandbox: VirtualSandbox | E2BSandbox
@@ -24,6 +25,7 @@ export class McpAgent {
   private repoUrl: string
   private prompt: string
   private workDir: string
+  private defaultBranch: string = 'main' // Will be detected during analysis
 
   constructor(repoUrl: string, prompt: string) {
     this.repoUrl = repoUrl
@@ -113,7 +115,7 @@ export class McpAgent {
     
     try {
       console.log('[AGENT] Starting agent with:', { repoUrl: this.repoUrl, prompt: this.prompt })
-      
+
       // Initialize sandbox
       await this.sandbox.initialize()
       yield { type: 'sandbox_create', message: 'Secure sandbox environment created', timestamp: new Date().toISOString() }
@@ -136,7 +138,7 @@ export class McpAgent {
       const repoDir = cloneResult.data?.path || '.'
       console.log('[AGENT] Clone completed, starting analysis...')
       yield { type: 'progress', message: 'Repository cloned, analyzing structure...', timestamp: new Date().toISOString(), progress: 20 }
-      
+
       // Analyze repository
       const { analysis, allFiles } = yield* this.analyzeRepository(repoDir)
       yield { type: 'analysis_update', message: `Repository analysis complete: ${analysis.totalFiles} files found`, timestamp: new Date().toISOString(), progress: 40 }
@@ -191,14 +193,27 @@ export class McpAgent {
       const branchName = `codepilot/${Date.now()}`
       console.log('[AGENT] Creating branch:', branchName)
       
-      const branchResult = await this.runTool('git_branch', {
-        branchName
-      })
-      
+      // Create the branch
+      console.log('[AGENT] Creating branch:', branchName)
+      yield { type: 'progress', message: 'Creating feature branch...', timestamp: new Date().toISOString(), progress: 80 }
+
+              const branchResult = await this.runTool('git_branch', {
+          branchName
+        })
+
       if (!branchResult.success) {
         throw new Error(`Failed to create branch: ${branchResult.error}`)
       }
-      
+
+              // Extract current branch info from the git branch output logs for PR base
+        if (typeof branchResult.data === 'string' && branchResult.data.includes('CURRENT_BRANCH:')) {
+          const branchMatch = branchResult.data.match(/CURRENT_BRANCH:\s*(\w+)/);
+          if (branchMatch) {
+            this.defaultBranch = branchMatch[1];
+            console.log(`[AGENT] Detected default branch from git operation: ${this.defaultBranch}`);
+          }
+        }
+
       // Implement the changes
       yield { type: 'progress', message: 'Implementing changes...', timestamp: new Date().toISOString(), progress: 60 }
       yield* this.implementPlan(plan, this.prompt, repoDir, analysis.projectRoot)
@@ -249,7 +264,7 @@ export class McpAgent {
       const pushResult = await this.runTool('git_push', {
         branchName
       })
-      
+
       if (!pushResult.success) {
         throw new Error(`Failed to push changes: ${pushResult.error}`)
       }
@@ -264,7 +279,7 @@ export class McpAgent {
         const prUrl = await this.createPullRequest(
           this.repoUrl,
           branchName,
-          'main',
+          this.defaultBranch,
           `Improve login and registration logic`,
           `This PR enhances the login and registration functionality with better validation, error handling, and security features.
 
@@ -280,10 +295,10 @@ Requested by: Code Pilot Agent`
         yield { type: 'pr_created', message: `Pull request created: ${prUrl}`, timestamp: new Date().toISOString(), data: { url: prUrl } }
         
         // Add a complete event for the UI
-        yield { 
-          type: 'complete', 
+      yield {
+        type: 'complete',
           message: 'Task completed successfully!', 
-          timestamp: new Date().toISOString(), 
+        timestamp: new Date().toISOString(),
           data: { 
             prUrl: prUrl,
             prNumber: prUrl.split('/').pop(),
@@ -316,6 +331,129 @@ Requested by: Code Pilot Agent`
     return yield* this.runTool('clone_repository', params, 'Repository cloned successfully.')
   }
 
+  /**
+   * Use LLM to intelligently analyze repository structure and identify key components
+   */
+  private async analyzeRepositoryWithLLM(allFiles: FileInfo[]): Promise<{
+    projectType: string;
+    primaryLanguages: string[];
+    keyDirectories: string[];
+    keyFiles: string[];
+    backendFiles: string[];
+    frontendFiles: string[];
+    configFiles: string[];
+    analysisNotes: string;
+  }> {
+    // Sample representative files for LLM analysis (avoid overwhelming with too many files)
+    const sampleFiles = allFiles
+      .filter(f => !f.path.includes('node_modules') && !f.path.includes('.git'))
+      .slice(0, 50)
+      .map(f => f.path)
+      .join('\n');
+
+    const analysisPrompt = `Analyze this repository structure and provide intelligent insights:
+
+FILES (sample of ${allFiles.length} total):
+${sampleFiles}
+
+Analyze and return ONLY a JSON object with this structure:
+{
+  "projectType": "description of what this project is (e.g., 'Full-stack web app with React frontend and Python backend')",
+  "primaryLanguages": ["list", "of", "main", "programming", "languages"],
+  "keyDirectories": ["most", "important", "directories"],
+  "keyFiles": ["most", "important", "files", "for", "development"],
+  "backendFiles": ["files", "that", "handle", "server", "logic"],
+  "frontendFiles": ["files", "that", "handle", "client", "UI"],
+  "configFiles": ["configuration", "and", "build", "files"],
+  "analysisNotes": "brief summary of the repository structure and architecture"
+}
+
+Focus on:
+- Identifying the main application entry points
+- Distinguishing between frontend, backend, and configuration code
+- Understanding the project's architecture and tech stack
+- Highlighting files most likely to contain business logic`;
+
+    try {
+      const result = await this.openai.executeWithTools(
+        analysisPrompt,
+        '',
+        ['read_file'],
+        this.sandbox
+      );
+
+      const jsonMatch = result.content?.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        return JSON.parse(jsonMatch[0]);
+      }
+    } catch (error) {
+      console.error('[AGENT] LLM repository analysis failed:', error);
+    }
+
+    // Fallback to basic analysis
+    return this.fallbackRepositoryAnalysis(allFiles);
+  }
+
+  /**
+   * Fallback repository analysis when LLM analysis fails
+   */
+  private fallbackRepositoryAnalysis(allFiles: FileInfo[]): {
+    projectType: string;
+    primaryLanguages: string[];
+    keyDirectories: string[];
+    keyFiles: string[];
+    backendFiles: string[];
+    frontendFiles: string[];
+    configFiles: string[];
+    analysisNotes: string;
+  } {
+    const languages: { [key: string]: number } = {};
+    const directories = new Set<string>();
+    const backendFiles: string[] = [];
+    const frontendFiles: string[] = [];
+    const configFiles: string[] = [];
+
+    allFiles.forEach(file => {
+      const ext = path.extname(file.path).toLowerCase();
+      const lang = this.getLanguageFromExtension(ext);
+      const dir = path.dirname(file.path);
+      
+      if (lang) {
+        languages[lang] = (languages[lang] || 0) + 1;
+      }
+
+      if (dir !== '.' && !dir.includes('node_modules')) {
+        directories.add(dir.split('/')[0]);
+      }
+
+      // Basic categorization
+      if (file.path.match(/\.(py|java|go|rs|php|rb)$/)) {
+        backendFiles.push(file.path);
+      } else if (file.path.match(/\.(js|jsx|ts|tsx|vue|html|css)$/) && 
+                 file.path.match(/(src|components|pages|views)/)) {
+        frontendFiles.push(file.path);
+      } else if (file.path.match(/(package\.json|requirements\.txt|Cargo\.toml|pom\.xml|Gemfile|composer\.json)$/)) {
+        configFiles.push(file.path);
+      }
+    });
+
+    const primaryLanguages = Object.entries(languages)
+      .sort(([,a], [,b]) => b - a)
+      .slice(0, 3)
+      .map(([lang]) => lang);
+
+    return {
+      projectType: `Multi-language project with ${primaryLanguages.join(', ')}`,
+      primaryLanguages,
+      keyDirectories: Array.from(directories).slice(0, 5),
+      keyFiles: [...configFiles, ...backendFiles.slice(0, 3), ...frontendFiles.slice(0, 3)],
+      backendFiles: backendFiles.slice(0, 10),
+      frontendFiles: frontendFiles.slice(0, 10),
+      configFiles,
+      analysisNotes: `Detected ${Object.keys(languages).length} languages across ${directories.size} directories`
+    };
+  }
+
   private async *analyzeRepository(repoDir: string): AsyncGenerator<StreamEvent, { analysis: RepositoryAnalysis; allFiles: FileInfo[] }> {
     yield { type: 'analyze', message: 'Analyzing repository...', timestamp: new Date().toISOString() }
     console.log('[AGENT] Starting repository analysis for directory:', repoDir)
@@ -328,87 +466,110 @@ Requested by: Code Pilot Agent`
     const allFiles: FileInfo[] = listResult.data.files
     console.log(`[AGENT] Found ${allFiles.length} files.`)
 
-    // Step 2: Find the project root (most likely location of a package.json)
-    const packageJsonPaths = allFiles.filter(f => f.path.endsWith('package.json') && !f.path.includes('node_modules'))
-    let projectRoot = '.'
-    if (packageJsonPaths.length > 0) {
-      // Find the shallowest package.json
-      packageJsonPaths.sort((a, b) => a.path.split('/').length - b.path.split('/').length)
-      projectRoot = path.dirname(packageJsonPaths[0].path)
-    }
-    console.log(`[AGENT] Detected project root at: ${projectRoot}`)
+    // Step 2: Use LLM to intelligently analyze the repository
+    yield { type: 'analyze', message: 'Performing intelligent repository analysis...', timestamp: new Date().toISOString() }
+    const intelligentAnalysis = await this.analyzeRepositoryWithLLM(allFiles);
     
-    // Step 3: Analyze dependencies and framework from the root package.json
-    let dependencies: PackageInfo[] = []
-    let framework = ''
+    // Step 3: Detect project root based on LLM analysis and config files
+    let projectRoot = '.';
+    const rootCandidates = intelligentAnalysis.configFiles
+      .map(f => path.dirname(f))
+      .filter(dir => dir !== '.')
+      .sort((a, b) => a.split('/').length - b.split('/').length);
+    
+    if (rootCandidates.length > 0) {
+      projectRoot = rootCandidates[0];
+    }
+    console.log(`[AGENT] Detected project root at: ${projectRoot}`);
+
+    // Step 4: Try to detect framework/dependencies from primary config files
+    let dependencies: PackageInfo[] = [];
+    let framework = '';
     let packageManager: 'npm' | 'yarn' | 'pnpm' | 'bun' | undefined = undefined;
 
-    const rootPackageJsonPath = allFiles.find(f => f.path === (projectRoot === '.' ? 'package.json' : `${projectRoot}/package.json`))
-    if (rootPackageJsonPath) {
-      const readResult = await this.sandbox.callTool('read_file', { path: rootPackageJsonPath.path })
+    // Try to read the main package.json if it exists
+    const mainPackageJson = intelligentAnalysis.configFiles.find(f => f.endsWith('package.json') && !f.includes('node_modules'));
+    if (mainPackageJson) {
+      const readResult = await this.sandbox.callTool('read_file', { path: mainPackageJson });
       if (readResult.success && readResult.data.content) {
         try {
-          const pkg = JSON.parse(readResult.data.content)
+          const pkg = JSON.parse(readResult.data.content);
           const allDeps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
           dependencies = Object.keys(allDeps).map(name => ({ 
             name, 
             version: allDeps[name],
-            type: 'npm' // Default to npm, can be refined later
+            type: 'npm'
           }));
 
-          if (dependencies.some(d => d.name === 'react')) framework = 'React'
-          else if (dependencies.some(d => d.name === 'vue')) framework = 'Vue'
-          else if (dependencies.some(d => d.name === '@angular/core')) framework = 'Angular'
-          
-          if (allFiles.some(f => f.path.includes('next.config.js'))) framework = 'Next.js'
-          else if (dependencies.some(d => d.name === 'express')) framework = 'Express'
+          // Framework detection
+          if (dependencies.some(d => d.name === 'react')) framework = 'React';
+          else if (dependencies.some(d => d.name === 'vue')) framework = 'Vue';
+          else if (dependencies.some(d => d.name === '@angular/core')) framework = 'Angular';
+          else if (dependencies.some(d => d.name === 'next')) framework = 'Next.js';
+          else if (dependencies.some(d => d.name === 'express')) framework = 'Express';
 
-          if (allFiles.some(f => f.path.endsWith('yarn.lock'))) packageManager = 'yarn'
-          else if (allFiles.some(f => f.path.endsWith('pnpm-lock.yaml'))) packageManager = 'pnpm'
-          else if (allFiles.some(f => f.path.endsWith('package-lock.json'))) packageManager = 'npm'
-
+          // Package manager detection
+          if (allFiles.some(f => f.path.endsWith('yarn.lock'))) packageManager = 'yarn';
+          else if (allFiles.some(f => f.path.endsWith('pnpm-lock.yaml'))) packageManager = 'pnpm';
+          else if (allFiles.some(f => f.path.endsWith('package-lock.json'))) packageManager = 'npm';
         } catch (e) {
-          console.log('[AGENT] Could not parse package.json for framework detection:', e)
+          console.log('[AGENT] Could not parse package.json:', e);
         }
       }
     }
-    console.log(`[AGENT] Detected framework: ${framework}, dependencies: ${dependencies.length}, package manager: ${packageManager}`)
 
-    // Step 4: Analyze languages and identify key files
-    const languages: { [key: string]: number } = {}
-    const keyFiles: string[] = []
-
+    // Step 5: Get language distribution
+    const languages: Record<string, number> = {}
     allFiles.forEach(file => {
       const ext = path.extname(file.path).toLowerCase()
       const lang = this.getLanguageFromExtension(ext)
       if (lang) {
         languages[lang] = (languages[lang] || 0) + 1
       }
-      // Simple heuristic for key files: package.json, configs, entry points
-      if (file.path.endsWith('package.json') || 
-          file.path.match(/vite|webpack|next\.config|tailwind\.config/i) ||
-          file.path.match(/src\/(index|main|App)\.(js|ts|jsx|tsx)$/i)) {
-        keyFiles.push(file.path)
+    })
+
+    // Step 6: Detect default branch
+    try {
+      const gitStatusResult = await this.sandbox.callTool('git_status', { repoPath: '.' });
+      if (gitStatusResult.success && gitStatusResult.data) {
+        // Extract branch info from git status output
+        const output = gitStatusResult.data;
+        if (typeof output === 'string') {
+          const branchMatch = output.match(/CURRENT_BRANCH:\s*(\w+)/);
+          if (branchMatch) {
+            this.defaultBranch = branchMatch[1];
+            console.log(`[AGENT] Detected default branch: ${this.defaultBranch}`);
+          }
+        }
       }
-    });
+    } catch (error) {
+      console.log('[AGENT] Could not detect default branch, using "main"');
+    }
 
     const analysis: RepositoryAnalysis = {
       totalFiles: allFiles.length,
       languages,
       structure: this.summarizeStructure(allFiles),
-      keyFiles: keyFiles.slice(0, 15), // Limit for prompt efficiency
+      keyFiles: intelligentAnalysis.keyFiles,
       dependencies,
       framework,
       packageManager,
       projectRoot,
-    }
+      // Add new intelligent analysis fields
+      projectType: intelligentAnalysis.projectType,
+      backendFiles: intelligentAnalysis.backendFiles,
+      frontendFiles: intelligentAnalysis.frontendFiles,
+      primaryLanguages: intelligentAnalysis.primaryLanguages,
+      analysisNotes: intelligentAnalysis.analysisNotes,
+    };
 
-    console.log('[AGENT] Analysis created:', {
-      totalFiles: analysis.totalFiles,
-      languages: analysis.languages,
-      projectRoot: analysis.projectRoot,
-      framework: analysis.framework,
-    })
+    console.log('[AGENT] Intelligent analysis completed:', {
+      projectType: analysis.projectType,
+      primaryLanguages: analysis.primaryLanguages,
+      backendFiles: analysis.backendFiles?.length || 0,
+      frontendFiles: analysis.frontendFiles?.length || 0,
+    });
+
     yield { type: 'analyze', message: 'Repository analysis complete.', timestamp: new Date().toISOString() }
     return { analysis, allFiles }
   }
@@ -477,95 +638,108 @@ Requested by: Code Pilot Agent`
     };
   }
 
+  /**
+   * Create implementation plan using intelligent analysis
+   */
   private async *createPlan(prompt: string, analysis: RepositoryAnalysis, allFiles: FileInfo[]): AsyncGenerator<StreamEvent, ImplementationPlan> {
     yield { type: 'plan', message: 'Creating implementation plan...', timestamp: new Date().toISOString() }
     console.log('[AGENT] Creating plan for prompt:', prompt)
-    console.log('[AGENT] Analysis data:', { totalFiles: analysis.totalFiles, keyFiles: analysis.keyFiles })
+    
+    // Determine if this is a backend-focused request
+    const isBackendFocused = prompt.toLowerCase().includes('backend') || 
+                            prompt.toLowerCase().includes('server') ||
+                            prompt.toLowerCase().includes('api') ||
+                            prompt.toLowerCase().includes('database');
+
+    const isFrontendFocused = prompt.toLowerCase().includes('frontend') || 
+                             prompt.toLowerCase().includes('ui') ||
+                             prompt.toLowerCase().includes('client') ||
+                             prompt.toLowerCase().includes('react') ||
+                             prompt.toLowerCase().includes('vue');
+
+    const focusHint = isBackendFocused ? '🎯 BACKEND-FOCUSED REQUEST: Prioritize server-side files and logic' : 
+                     isFrontendFocused ? '🎯 FRONTEND-FOCUSED REQUEST: Prioritize client-side files and UI' : '';
+
+    // Context-aware planning prompt
+    const planningPrompt = `You are an AI coding assistant. Analyze the repository and create an implementation plan.
+
+Repository Context:
+- Total files: ${analysis.totalFiles}
+- Project type: ${analysis.projectType || 'Unknown'}
+- Primary languages: ${analysis.primaryLanguages?.join(', ') || 'Unknown'}
+- Backend files: ${analysis.backendFiles || 0}
+- Frontend files: ${analysis.frontendFiles || 0}
+
+${focusHint}
+
+Task: ${prompt}
+
+CRITICAL: You MUST respond with ONLY a JSON object in this exact format:
+\`\`\`json
+{
+  "approach": "Brief description of your approach",
+  "filesToModify": ["Backend/app.py", "other/file.js"],
+  "newFiles": ["new/file.py"],
+  "estimatedComplexity": "low"
+}
+\`\`\`
+
+Do NOT include any other text, markdown, or explanations outside the JSON block.
+Do NOT use nested objects like "implementation_plan" or "backend"/"frontend" - use flat structure only.`
 
     try {
-      // Use tool-enabled approach for smarter planning
-      const toolNames = this.sandbox.getAvailableTools()
-      const availableTools = toolNames.filter(name => 
-        ['read_file', 'list_files'].includes(name) // Only use read tools for planning
-      ).map(name => {
-        const schema = this.sandbox.getToolSchema(name)
-        return {
-          type: 'function',
-          function: {
-            name: name,
-            description: schema?.description || `Execute ${name} tool`,
-            parameters: schema || { type: 'object', properties: {} }
-          }
-        }
-      })
-
-      const self = this
-      const toolExecutor = async (toolName: string, params: any) => {
-        console.log(`[AGENT] Planning tool: ${toolName}`)
-        return await self.sandbox.callTool(toolName as any, params)
-      }
-
-    const context = `Repository Analysis:
-- Total files: ${analysis.totalFiles}
-- Key files: ${analysis.keyFiles.join(', ') || 'None found'}
-- Package manager: ${analysis.packageManager || 'Unknown'}
-- Framework: ${analysis.framework || 'Unknown'}
-- Detected Project Root: ${analysis.projectRoot || 'Not detected'}
-
-Sample files from repository:
-${allFiles.slice(0, 20).map(f => f.path).join('\n')}
-
-You can use read_file and list_files tools to better understand the codebase structure before creating your plan.
-
-Create a JSON implementation plan with these exact fields:
-- approach: string describing your strategy
-- filesToModify: array of file paths that need changes
-- newFiles: array of file paths for new files to create
-- estimatedComplexity: "low", "medium", or "high"
-
-User Request: ${prompt}`
-
-      const planningPrompt = `Analyze the repository structure and create a detailed implementation plan for: "${prompt}"
-
-Use the available tools to explore the codebase first, then respond with a JSON object containing your implementation plan.`
-
-      yield { type: 'plan', message: 'Analyzing repository structure...', timestamp: new Date().toISOString() }
-
-      const { result } = await this.openai.executeWithTools(
+      const planResult = await this.openai.executeWithTools(
         planningPrompt,
-        context,
-        availableTools,
-        toolExecutor
-      )
+        `Task: ${prompt}`,
+        ['list_files', 'read_file'],
+        this.sandbox
+      );
 
-      console.log('[AGENT] AI planning result:', result.slice(0, 500))
+      const aiResult = planResult.content || '';
+      console.log('[AGENT] AI planning result:', aiResult.slice(0, 500));
 
-      // Use a more robust regex to find the JSON blob, even with leading/trailing text
-      const jsonMatch = result.match(/```json\s*([\s\S]+?)\s*```/);
-      if (!jsonMatch || jsonMatch.length < 2) {
-        console.error('[AGENT] AI response did not contain a valid JSON code block. Raw response:', result)
-        throw new Error('AI failed to return a valid implementation plan in the expected JSON format.')
+      // Enhanced plan parsing with better extraction
+      const jsonMatch = aiResult.match(/```json\s*([\s\S]+?)\s*```/) || aiResult.match(/\{[\s\S]*\}/);
+      if (!jsonMatch || jsonMatch.length < 1) {
+        console.error('[AGENT] AI response did not contain valid JSON. Raw response:', aiResult);
+        throw new Error('AI failed to return a valid implementation plan in JSON format.');
       }
 
-      const planJson = jsonMatch[1];
-      let aiPlan;
+      const planJson = jsonMatch[0].replace(/```json|```/g, '').trim();
+      let aiPlan: any;
       
       try {
         const parsedJson = JSON.parse(planJson);
-        
-        // Handle both direct format and nested "implementation_plan" format
         aiPlan = parsedJson.implementation_plan || parsedJson;
         
         console.log('[AGENT] Parsed plan structure:', JSON.stringify(aiPlan, null, 2).slice(0, 500));
         
-        // Extract files to modify from steps if needed
+        // Enhanced file extraction from nested structures
         if (aiPlan.steps && Array.isArray(aiPlan.steps) && (!aiPlan.filesToModify || aiPlan.filesToModify.length === 0)) {
-          aiPlan.filesToModify = aiPlan.steps
-            .filter((step: any) => step.details && step.details.file)
-            .map((step: any) => step.details.file);
-          
-          console.log('[AGENT] Extracted files to modify from steps:', aiPlan.filesToModify);
+          aiPlan.filesToModify = [];
+          aiPlan.steps.forEach((step: any) => {
+            if (step.details?.file) aiPlan.filesToModify.push(step.details.file);
+            if (step.file) aiPlan.filesToModify.push(step.file);
+            if (step.actions) {
+              step.actions.forEach((action: any) => {
+                if (action.file) aiPlan.filesToModify.push(action.file);
+              });
+            }
+          });
+          console.log('[AGENT] Extracted files from steps:', aiPlan.filesToModify);
         }
+
+        // Intelligent fallback based on task context
+        if (!aiPlan.filesToModify || aiPlan.filesToModify.length === 0) {
+          if (isBackendFocused && analysis.backendFiles && analysis.backendFiles.length > 0) {
+            aiPlan.filesToModify = analysis.backendFiles.slice(0, 3);
+            console.log('[AGENT] Using backend files as fallback:', aiPlan.filesToModify);
+          } else if (isFrontendFocused && analysis.frontendFiles && analysis.frontendFiles.length > 0) {
+            aiPlan.filesToModify = analysis.frontendFiles.slice(0, 3);
+            console.log('[AGENT] Using frontend files as fallback:', aiPlan.filesToModify);
+          }
+        }
+        
       } catch (error) {
         console.error('[AGENT] Failed to parse plan JSON:', error);
         throw new Error('Failed to parse the AI-generated implementation plan.');
@@ -576,41 +750,55 @@ Use the available tools to explore the codebase first, then respond with a JSON 
         console.error('[AGENT] AI returned an empty or invalid plan:', aiPlan);
         throw new Error('AI planner returned an empty plan. There are no files to modify or create.');
       }
-      
-      // Validate and clean the plan
+
+      // Generate final plan
       const plan: ImplementationPlan = {
-        approach: (aiPlan.approach || 'Implement requested changes').slice(0, 500),
-        filesToModify: Array.isArray(aiPlan.filesToModify) ? aiPlan.filesToModify : [],
-        newFiles: Array.isArray(aiPlan.newFiles) ? aiPlan.newFiles : [],
+        approach: aiPlan.approach || 'Implement requested changes',
+        filesToModify: aiPlan.filesToModify || [],
+        newFiles: aiPlan.newFiles || [],
         steps: [],
         considerations: [],
         estimatedComplexity: aiPlan.estimatedComplexity || 'medium',
-        technologies: [],
-      }
-      
-      console.log('[AGENT] Generated plan:', plan)
+        technologies: analysis.primaryLanguages || []
+      };
 
-      yield { type: 'plan', message: 'Implementation plan created.', data: plan, timestamp: new Date().toISOString() }
-      return plan
+      console.log('[AGENT] Generated plan:', {
+        filesToModify: plan.filesToModify,
+        newFiles: plan.newFiles,
+        approach: plan.approach
+      });
+
+      yield { type: 'plan', message: 'Implementation plan created.', timestamp: new Date().toISOString() }
+      return plan;
 
     } catch (error) {
-      console.error('[AGENT] Planning failed:', error)
+      console.error('[AGENT] Planning failed:', error);
+      yield { type: 'plan', message: 'Created fallback plan due to planning error.', timestamp: new Date().toISOString() }
       
-      // Fallback plan
-      const fallbackPlan: ImplementationPlan = {
+      // Enhanced fallback plan with intelligent context
+      const plan: ImplementationPlan = {
         approach: `Implement: ${prompt}`,
-        filesToModify: allFiles.filter(f => 
-          f.path.includes('.js') || f.path.includes('.ts') || f.path.includes('.jsx') || f.path.includes('.tsx')
-        ).slice(0, 3).map(f => f.path),
+        filesToModify: [],
         newFiles: [],
         steps: [],
         considerations: [],
         estimatedComplexity: 'medium',
-        technologies: [],
+        technologies: analysis.primaryLanguages || []
+      };
+      
+      // Smart fallback based on context and available files
+      if (isBackendFocused && analysis.backendFiles && analysis.backendFiles.length > 0) {
+        plan.filesToModify = analysis.backendFiles.slice(0, 3);
+        console.log('[AGENT] Created fallback plan with backend files:', plan.filesToModify);
+      } else if (isFrontendFocused && analysis.frontendFiles && analysis.frontendFiles.length > 0) {
+        plan.filesToModify = analysis.frontendFiles.slice(0, 3);
+        console.log('[AGENT] Created fallback plan with frontend files:', plan.filesToModify);
+      } else {
+        // Default fallback - use key files
+        plan.filesToModify = analysis.keyFiles?.slice(0, 3) || [];
       }
       
-      yield { type: 'plan', message: 'Created fallback plan due to planning error.', data: fallbackPlan, timestamp: new Date().toISOString() }
-      return fallbackPlan
+      return plan;
     }
   }
 
@@ -626,7 +814,7 @@ Use the available tools to explore the codebase first, then respond with a JSON 
     yield { type: 'implement', message: 'Starting implementation...', timestamp: new Date().toISOString() }
     
     console.log('[AGENT] Implementing plan:', { filesToModify: plan.filesToModify, newFiles: plan.newFiles })
-    
+
     try {
       // Use autonomous implementation with direct tool access
       yield* this.implementWithTools(plan, prompt)
@@ -652,19 +840,25 @@ Use the available tools to explore the codebase first, then respond with a JSON 
 You are currently in a Git repository that has been cloned to the current directory.
 The repository is on branch 'codepilot/${Date.now()}' and you need to implement changes based on the user's request.
 
-Your task: ${prompt}
+You have access to these tools: list_files, read_file, write_file, git_add, git_status, git_commit
 
-Files to modify based on the plan:
-${plan.filesToModify.map(file => `- ${file}`).join('\n')}
+CRITICAL WORKFLOW:
+1. First, use list_files to understand the structure (1 call max)
+2. Use read_file to read relevant files (2-3 calls max)
+3. Use write_file to modify files based on the user's request
+4. Use git_add to stage your changes
+5. Use git_commit to commit your changes
+6. STOP when changes are committed
 
-${plan.newFiles.length > 0 ? `New files to create:\n${plan.newFiles.map(file => `- ${file}`).join('\n')}` : ''}
+RULES:
+- Do NOT read the same file multiple times unless you've written to it
+- Make meaningful changes - don't just read files repeatedly
+- Use relative paths from the repository root (e.g., "Backend/app.py")
+- After making changes, ALWAYS use git_add and git_commit
+- The user's request: "${prompt}"
+- Stop after successfully committing changes
 
-IMPORTANT: 
-1. You are already in the repository directory. DO NOT try to clone the repository again.
-2. Use relative paths from the repository root (e.g. "src/file.js" not "/tmp/repo/src/file.js").
-3. Use git_add and git_commit after making changes.
-4. Make sure to implement robust validation, error handling, and security best practices.
-5. Focus on improving the login and registration functionality.`
+Start by listing files to understand the structure, then read and modify the relevant files.`
 
     // Execute the implementation with tools
     try {
@@ -819,16 +1013,29 @@ IMPORTANT:
 
   private async createPullRequest(repoUrl: string, branchName: string, baseBranch: string, title: string, body: string): Promise<string> {
     console.log('[AGENT] Creating pull request...');
-    
+
     const { owner, repo } = this.parseRepoUrl(repoUrl)
     
     try {
+      // Get repository info to get the actual default branch
+      let actualBaseBranch = baseBranch
+      
+      try {
+        const repoInfo = await githubAPI.getRepository(owner, repo)
+        if (repoInfo && repoInfo.defaultBranch) {
+          actualBaseBranch = repoInfo.defaultBranch
+          console.log(`[AGENT] Using repository's default branch: ${actualBaseBranch}`)
+        }
+      } catch (error) {
+        console.warn(`[AGENT] Could not get repository info, using provided base branch: ${baseBranch}`)
+      }
+      
       const prResult = await createPullRequestFromRepo(
         repoUrl,
         title,
         body,
         branchName,
-        baseBranch
+        actualBaseBranch
       )
 
       console.log('[AGENT] PR created successfully:', prResult.url)
@@ -876,7 +1083,7 @@ IMPORTANT:
       const completedEvent: StreamEvent = {
         type: 'tool_call',
         message: successMessage || (result.success ? `${toolName} completed successfully.` : `${toolName} failed: ${result.error}`),
-        timestamp: new Date().toISOString(),
+          timestamp: new Date().toISOString(),
         details: {
           tool: toolName,
           operation: 'completed',

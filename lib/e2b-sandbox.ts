@@ -650,23 +650,44 @@ print("PUSH_RETURN_CODE:", result.returncode)
             console.log(`[E2B] Creating branch '${branchName}' in ${targetDir}`)
 
             try {
-              const from = fromBranch || 'main'
-              
-              // First, let's check the current state and ensure we're in a git repo
-              const statusResult = await this.sandbox!.runCode(`
+              // First, detect the current branch to use as base
+              const detectBranchResult = await this.sandbox!.runCode(`
 import subprocess
 import os
 
 try:
     os.chdir('${targetDir}')
-    print(f"WORKING_DIR: {os.getcwd()}")
-    
+    # Get current branch
+    current_branch = subprocess.run(['git', 'branch', '--show-current'], capture_output=True, text=True)
+    if current_branch.returncode == 0:
+        print(f"CURRENT_BRANCH: {current_branch.stdout.strip()}")
+    else:
+        print("CURRENT_BRANCH: main")  # fallback
+except Exception as e:
+    print("CURRENT_BRANCH: main")  # fallback
+              `)
+              
+              // Extract the current branch
+              const branchDetectionOutput = detectBranchResult.logs.stdout.join('\n')
+              const branchMatch = branchDetectionOutput.match(/CURRENT_BRANCH:\s*(\w+)/)
+              const from = fromBranch || (branchMatch ? branchMatch[1] : 'main')
+              
+              console.log(`[E2B] Using base branch: ${from}`)
+              
+              // Now check the current state and ensure we're in a git repo
+              const statusResult = await this.sandbox!.runCode(`
+import subprocess
+import os
+import sys
+
+try:
+    os.chdir('${targetDir}')
     # Check if this is a git repository
     result = subprocess.run(['git', 'status'], capture_output=True, text=True)
     print(f"GIT_STATUS_CHECK: {result.returncode}")
     if result.returncode != 0:
         print(f"NOT_A_GIT_REPO: {result.stderr}")
-        raise Exception("Not a git repository")
+        sys.exit(1)
     
     # Show current branch
     current_branch = subprocess.run(['git', 'branch', '--show-current'], capture_output=True, text=True)
@@ -680,19 +701,21 @@ try:
     
 except Exception as e:
     print(f"STATUS_CHECK_ERROR: {e}")
-          `)
-          
-          const statusOutput = statusResult.logs.stdout.join('\n')
-          console.log('[E2B] Status check output:', statusOutput)
-          
-          if (!statusOutput.includes('STATUS_CHECK_SUCCESS')) {
-            throw new Error(`Git repository check failed: ${statusOutput}`)
-          }
-          
-          // Now create the branch
-          const branchResult = await this.sandbox!.runCode(`
+    sys.exit(1)
+              `)
+              
+              const statusOutput = statusResult.logs.stdout.join('\n')
+              console.log('[E2B] Status check output:', statusOutput)
+              
+              if (!statusOutput.includes('STATUS_CHECK_SUCCESS')) {
+                throw new Error(`Git repository check failed: ${statusOutput}`)
+              }
+              
+              // Now create the branch
+              const branchResult = await this.sandbox!.runCode(`
 import subprocess
 import os
+import sys
 
 try:
     os.chdir('${targetDir}')
@@ -707,53 +730,61 @@ try:
     
     if checkout_result.returncode != 0:
         print(f"CHECKOUT_FAILED: {checkout_result.stderr}")
-        # Try to create the base branch if it doesn't exist
-        fetch_result = subprocess.run(['git', 'fetch', 'origin'], capture_output=True, text=True)
-        print(f"FETCH_RESULT: {fetch_result.returncode}")
-        checkout_result = subprocess.run(['git', 'checkout', '-b', '${from}', 'origin/${from}'], capture_output=True, text=True)
-        print(f"CREATE_BASE_RETURNCODE: {checkout_result.returncode}")
-    
-    # Create and checkout the new branch
-    print(f"CREATING_NEW_BRANCH: ${branchName}")
-    branch_result = subprocess.run(['git', 'checkout', '-b', '${branchName}'], capture_output=True, text=True)
-    print(f"BRANCH_RETURNCODE: {branch_result.returncode}")
-    print(f"BRANCH_STDOUT: {branch_result.stdout}")
-    print(f"BRANCH_STDERR: {branch_result.stderr}")
-    
-    if branch_result.returncode == 0:
-        # Verify we're on the new branch
-        verify_result = subprocess.run(['git', 'branch', '--show-current'], capture_output=True, text=True)
-        current_branch = verify_result.stdout.strip()
-        print(f"VERIFIED_BRANCH: {current_branch}")
+        # Try to create the branch directly from current HEAD
+        print("ATTEMPTING_DIRECT_BRANCH_CREATION")
+        branch_result = subprocess.run(['git', 'checkout', '-b', '${branchName}'], capture_output=True, text=True)
+        print(f"DIRECT_BRANCH_RETURNCODE: {branch_result.returncode}")
+        print(f"DIRECT_BRANCH_STDOUT: {branch_result.stdout}")
+        print(f"DIRECT_BRANCH_STDERR: {branch_result.stderr}")
         
-        if current_branch == '${branchName}':
+        if branch_result.returncode == 0:
             print("BRANCH_CREATION_SUCCESS")
         else:
-            print(f"BRANCH_VERIFICATION_FAILED: Expected ${branchName}, got {current_branch}")
+            print(f"BRANCH_CREATION_FAILED: {branch_result.stderr}")
+            sys.exit(1)
     else:
-        print(f"BRANCH_CREATION_FAILED: {branch_result.stderr}")
+        # Create and checkout the new branch
+        print(f"CREATING_NEW_BRANCH: ${branchName}")
+        branch_result = subprocess.run(['git', 'checkout', '-b', '${branchName}'], capture_output=True, text=True)
+        print(f"BRANCH_RETURNCODE: {branch_result.returncode}")
+        print(f"BRANCH_STDOUT: {branch_result.stdout}")
+        print(f"BRANCH_STDERR: {branch_result.stderr}")
         
+        if branch_result.returncode == 0:
+            # Verify we're on the new branch
+            verify_result = subprocess.run(['git', 'branch', '--show-current'], capture_output=True, text=True)
+            current_branch = verify_result.stdout.strip()
+            print(f"VERIFIED_BRANCH: {current_branch}")
+            
+            if current_branch == '${branchName}':
+                print("BRANCH_CREATION_SUCCESS")
+            else:
+                print(f"BRANCH_VERIFICATION_FAILED: Expected ${branchName}, got {current_branch}")
+                sys.exit(1)
+        else:
+            print(f"BRANCH_CREATION_FAILED: {branch_result.stderr}")
+            sys.exit(1)
+    
 except Exception as e:
     print(f"BRANCH_CREATION_ERROR: {e}")
-          `)
-          
-          const branchOutput = branchResult.logs.stdout.join('\n')
-          console.log('[E2B] Branch creation output:', branchOutput)
-          
-          // Check if branch creation was successful
-          if (branchOutput.includes('BRANCH_CREATION_SUCCESS')) {
-            return {
-              success: true,
-              stdout: `Successfully created and switched to branch ${branchName}`,
-              toolName: 'git_branch',
-              executionTime: Date.now() - startTime,
+    sys.exit(1)
+              `)
+              
+              const branchOutput = branchResult.logs.stdout.join('\n')
+              console.log('[E2B] Branch creation output:', branchOutput)
+              
+              if (!branchOutput.includes('BRANCH_CREATION_SUCCESS')) {
+                throw new Error(`Failed to create branch: ${branchOutput}`)
+              }
+
+          return {
+            success: true,
+            data: {
+              branchName,
+              currentBranch: branchOutput.includes('VERIFIED_BRANCH:') ? branchOutput.match(/VERIFIED_BRANCH:\s*(\w+)/)[1] : 'main', // Include this so the agent can use it
+              output: branchOutput
             }
-          } else {
-            const errorMsg = branchOutput.includes('BRANCH_CREATION_ERROR') 
-              ? branchOutput.split('BRANCH_CREATION_ERROR:')[1]?.trim() 
-              : 'Unknown error during branch creation'
-            throw new Error(`Branch creation failed: ${errorMsg}`)
-          }
+          };
         } catch (error: any) {
           console.error('[E2B] Git branch error:', error.message)
           return {

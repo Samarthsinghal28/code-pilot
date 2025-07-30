@@ -198,7 +198,7 @@ TASK: ${instruction}`
     let totalUsage = { totalTokens: 0, promptTokens: 0, completionTokens: 0, cost: 0 }
 
     // Reduced rounds for efficiency, with budget awareness
-    const maxRounds = budget && budget.tokensRemaining < 5000 ? 5 : 8
+    const maxRounds = budget && budget.tokensRemaining < 5000 ? 5 : 16
     
     for (let round = 0; round < maxRounds; round++) {
       console.log(`[OPENAI] Tool calling round ${round + 1}/${maxRounds}`)
