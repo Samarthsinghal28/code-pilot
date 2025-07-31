@@ -157,8 +157,7 @@ def list_files(startpath):
     for f in files:
         print(f) # Print actual file paths to stdout
 
-list_files('${targetPath}')
-`
+list_files('${targetPath}')`
           const result = await this.sandbox!.runCode(code)
           const files = result.logs.stdout
             .join('\n') // Join all stdout lines first
@@ -356,10 +355,10 @@ except Exception as e:
         inputSchema: {
             type: 'object',
             properties: {
-                paths: { type: 'array', items: { type: 'string' } },
+                files: { type: 'array', items: { type: 'string' } },
                 repoPath: { type: 'string', default: '' },
             },
-            required: ['paths'],
+            required: ['files'],
         },
         execute: async (params) => {
             const startTime = Date.now()
@@ -367,24 +366,50 @@ except Exception as e:
             await this.ensureSandbox()
             
             const targetDir = repoPath ? `${this.workDir}/${repoPath}` : this.workDir
-            const filesToAdd = files?.join(' ') || '.'
-            console.log(`[E2B] Staging files in ${targetDir}`)
+            const filesToAdd = Array.isArray(files) ? files.join(' ') : '.'
+            console.log(`[E2B] Staging files in ${targetDir}:`, filesToAdd)
 
             try {
-                const result = await this.sandbox!.runCode(`
+                const code = `
 import subprocess
 import os
 import sys
+
 os.chdir('${targetDir}')
+print(f"WORKING_DIR: {os.getcwd()}")
+
 try:
-    subprocess.run(['git', 'add', '${filesToAdd}'], check=True)
-    print("SUCCESS")
-except subprocess.CalledProcessError as e:
-    print(str(e), file=sys.stderr)
-                `)
+    # Use git add with each file individually to avoid issues
+    files = ${JSON.stringify(files)}
+    if not files:
+        files = ['.']
+    
+    for file in files:
+        result = subprocess.run(['git', 'add', file], 
+                              capture_output=True, text=True)
+        print(f"ADD_RESULT_{file}: {result.returncode}")
+        print(f"ADD_STDOUT_{file}: {result.stdout}")
+        print(f"ADD_STDERR_{file}: {result.stderr}")
+        
+        if result.returncode != 0:
+            print(f"FAILED_TO_ADD: {file}")
+            print(f"ERROR: {result.stderr}")
+            sys.exit(1)
+    
+    print("GIT_ADD_SUCCESS")
+except Exception as e:
+    print(f"GIT_ADD_ERROR: {str(e)}")
+    sys.exit(1)
+                `
                 
-                if (result.logs.stdout.join('').trim() !== 'SUCCESS') {
-                    throw new Error(result.logs.stderr.join('\\n') || 'git add command failed')
+                const result = await this.sandbox!.runCode(code)
+                const stdout = result.logs.stdout.join('\n')
+                const stderr = result.logs.stderr.join('\n')
+                
+                console.log('[E2B] git_add output:', stdout)
+                
+                if (!stdout.includes('GIT_ADD_SUCCESS')) {
+                    throw new Error(stderr || stdout || 'git add command failed')
                 }
                 
                 return {
@@ -394,6 +419,7 @@ except subprocess.CalledProcessError as e:
                     executionTime: Date.now() - startTime,
                 }
             } catch (error: any) {
+                console.error('[E2B] git_add failed:', error)
                 return {
                     success: false,
                     error: `Git add failed: ${error.message}`,
@@ -702,17 +728,17 @@ try:
 except Exception as e:
     print(f"STATUS_CHECK_ERROR: {e}")
     sys.exit(1)
-              `)
-              
-              const statusOutput = statusResult.logs.stdout.join('\n')
-              console.log('[E2B] Status check output:', statusOutput)
-              
-              if (!statusOutput.includes('STATUS_CHECK_SUCCESS')) {
-                throw new Error(`Git repository check failed: ${statusOutput}`)
-              }
-              
-              // Now create the branch
-              const branchResult = await this.sandbox!.runCode(`
+          `)
+          
+          const statusOutput = statusResult.logs.stdout.join('\n')
+          console.log('[E2B] Status check output:', statusOutput)
+          
+          if (!statusOutput.includes('STATUS_CHECK_SUCCESS')) {
+            throw new Error(`Git repository check failed: ${statusOutput}`)
+          }
+          
+          // Now create the branch
+          const branchResult = await this.sandbox!.runCode(`
 import subprocess
 import os
 import sys
@@ -764,27 +790,33 @@ try:
         else:
             print(f"BRANCH_CREATION_FAILED: {branch_result.stderr}")
             sys.exit(1)
-    
+        
 except Exception as e:
     print(f"BRANCH_CREATION_ERROR: {e}")
     sys.exit(1)
-              `)
-              
-              const branchOutput = branchResult.logs.stdout.join('\n')
-              console.log('[E2B] Branch creation output:', branchOutput)
-              
-              if (!branchOutput.includes('BRANCH_CREATION_SUCCESS')) {
-                throw new Error(`Failed to create branch: ${branchOutput}`)
-              }
+          `)
+          
+          const branchOutput = branchResult.logs.stdout.join('\n')
+          console.log('[E2B] Branch creation output:', branchOutput)
+          
+          // Even if we don't see the success message, if the output contains "Switched to a new branch", consider it successful
+          if (!branchOutput.includes('BRANCH_CREATION_SUCCESS') && 
+              !branchOutput.includes('Switched to a new branch') && 
+              !branchOutput.includes('DIRECT_BRANCH_RETURNCODE: 0')) {
+            throw new Error(`Failed to create branch: ${branchOutput}`)
+          }
 
-          return {
-            success: true,
-            data: {
-              branchName,
-              currentBranch: branchOutput.includes('VERIFIED_BRANCH:') ? branchOutput.match(/VERIFIED_BRANCH:\s*(\w+)/)[1] : 'main', // Include this so the agent can use it
-              output: branchOutput
-            }
-          };
+            return {
+              success: true,
+              data: {
+                branchName,
+                currentBranch: branchOutput.includes('VERIFIED_BRANCH:') ? 
+                  (branchOutput.match(/VERIFIED_BRANCH:\s*(\w+)/) ? branchOutput.match(/VERIFIED_BRANCH:\s*(\w+)/)![1] : 'main') : 'main',
+                output: branchOutput
+              },
+              toolName: 'git_branch',
+              executionTime: Date.now() - startTime
+            };
         } catch (error: any) {
           console.error('[E2B] Git branch error:', error.message)
           return {
@@ -796,6 +828,81 @@ except Exception as e:
         }
       },
     })
+
+    this.tools.set('execute_shell', {
+      name: 'execute_shell',
+      description: 'Execute a shell command in the repository root',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          command: { type: 'string' },
+        },
+        required: ['command'],
+      },
+      execute: async (params) => {
+        const startTime = Date.now();
+        const { command } = params as ToolParameters['execute_shell'];
+        await this.ensureSandbox();
+        
+        console.log(`[E2B] Executing shell command: ${command}`);
+
+        try {
+          const code = `
+            import subprocess
+            import os
+            import sys
+            
+            os.chdir('${this.workDir}')
+            
+            try:
+                result = subprocess.run("${command}", shell=True, capture_output=True, text=True, timeout=${commandTimeout})
+                
+                print("STDOUT_START")
+                sys.stdout.write(result.stdout)
+                print("STDOUT_END")
+
+                print("STDERR_START", file=sys.stderr)
+                sys.stderr.write(result.stderr)
+                print("STDERR_END", file=sys.stderr)
+                
+                print(f"RETURN_CODE: {result.returncode}", file=sys.stderr)
+
+            except subprocess.TimeoutExpired:
+                print("EXECUTION_TIMEOUT", file=sys.stderr)
+            except Exception as e:
+                print(f"EXECUTION_ERROR: {str(e)}", file=sys.stderr)
+          `;
+          
+          const execResult = await this.sandbox!.runCode(code);
+          const stdout = execResult.logs.stdout.join('\n');
+          const stderr = execResult.logs.stderr.join('\n');
+
+          // Isolate stdout content
+          const stdoutMatch = stdout.match(/STDOUT_START\n([\s\S]*)\nSTDOUT_END/);
+          const stdoutContent = stdoutMatch ? stdoutMatch[1] : stdout;
+
+          if (stderr.includes('EXECUTION_ERROR') || stderr.includes('EXECUTION_TIMEOUT')) {
+            throw new Error(`Command execution failed: ${stderr}`);
+          }
+          
+          return {
+            success: true,
+            stdout: stdoutContent,
+            stderr: stderr,
+            data: stdoutContent, // For compatibility with getDiff
+            toolName: 'execute_shell',
+            executionTime: Date.now() - startTime,
+          };
+        } catch (error: any) {
+          return {
+            success: false,
+            error: `Shell command failed: ${error.message}`,
+            toolName: 'execute_shell',
+            executionTime: Date.now() - startTime,
+          };
+        }
+      },
+    });
   }
 
   private async ensureSandbox(): Promise<void> {

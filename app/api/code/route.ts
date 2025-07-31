@@ -6,12 +6,14 @@ import { StreamEvent } from '@/types'
 import { CodePilotError, ValidationError } from '@/lib/errors'
 import pLimit from 'p-limit'
 import { wrapAgent } from '@/lib/langsmith/tracer'
+import { registerAgentForSession } from '@/app/api/publish/route'
 
 const limit = pLimit(getExecutionLimits().maxConcurrentOperations);
 
 const CodeRequestSchema = z.object({
   repoUrl: z.string().url(),
   prompt: z.string().min(10),
+  verificationMode: z.boolean().optional().default(false)
 })
 
 export async function POST(request: NextRequest) {
@@ -30,10 +32,10 @@ export async function POST(request: NextRequest) {
     }
     console.log('[API] Request validated successfully')
 
-    const { repoUrl, prompt } = validation.data
-    console.log('[API] Creating agent with:', { repoUrl, prompt: prompt.slice(0, 100) })
+    const { repoUrl, prompt, verificationMode } = validation.data
+    console.log('[API] Creating agent with:', { repoUrl, prompt: prompt.slice(0, 100), verificationMode })
 
-    const agent = new McpAgent(repoUrl, prompt)
+    const agent = new McpAgent(repoUrl, prompt, verificationMode)
     console.log('[API] Agent created, wrapping with LangSmith tracer')
     
     const stream = await wrapAgent(agent)
@@ -45,7 +47,28 @@ export async function POST(request: NextRequest) {
         try {
           for await (const event of stream) {
             console.log('[API] Streaming event:', event.type, event.message.slice(0, 100))
+            
+            // If we get a pause_for_verification event, register the agent for later use
+            if (event.type === 'pause_for_verification' && verificationMode) {
+              const sessionId = event.data?.sessionId
+              if (sessionId) {
+                console.log(`[API_CODE_ROUTE] Registering agent for verification session: ${sessionId}`)
+                registerAgentForSession(sessionId, agent)
+              }
+            }
+            
             controller.enqueue(`data: ${JSON.stringify(event)}\n\n`)
+            
+            // If verification mode and we get pause, don't close the stream yet
+            if (event.type === 'pause_for_verification') {
+              console.log('[API] Pausing stream for verification...')
+              // Keep the stream open for the verification UI
+              return
+            }
+            
+            if (event.type === 'complete' || event.type === 'error') {
+              break
+            }
           }
           console.log('[API] Stream completed successfully')
         } catch (streamError) {

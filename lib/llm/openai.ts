@@ -381,8 +381,10 @@ TASK: ${instruction}`
 
   async generateCode(instruction: string, context: string, existingCode?: string): Promise<{ code: string; usage: TokenUsage }> {
     console.log('[OPENAI] Starting code generation...')
-    console.log('[OPENAI] Instruction:', instruction.slice(0, 100))
-    console.log('[OPENAI] Context:', context.slice(0, 100))
+    console.log('[OPENAI] Instruction:', instruction ? instruction.slice(0, 100) : 'undefined')
+    if (context) {
+      console.log('[OPENAI] Context:', context.slice(0, 100))
+    }
     console.log('[OPENAI] Existing code length:', existingCode?.length || 0)
 
     await this.initialize()

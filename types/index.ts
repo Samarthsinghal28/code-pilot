@@ -21,7 +21,11 @@ export const EventTypes = [
   'tool_call',
   'file_change',
   'progress',
-  'analysis_update'
+  'analysis_update',
+  'pause_for_verification',
+  'terminal_ready',
+  'diff_ready',
+  'pr_created'
 ]
 
 export type EventType = (typeof EventTypes)[number]
@@ -37,6 +41,7 @@ export interface StreamEvent {
     file?: string
     operation?: string
     status?: 'started' | 'completed' | 'failed'
+    error?: string
   }
 }
 
@@ -197,4 +202,40 @@ export type SandboxResult = {
 export interface CodePilotError extends Error {
   isOperational?: boolean
   details?: any
+}
+
+// Verification workflow types
+export interface VerificationSession {
+  sessionId: string
+  sandboxId: string
+  repoPath: string
+  branchName: string
+  status: 'pending' | 'active' | 'completed' | 'expired'
+  createdAt: Date
+  expiresAt: Date
+  filesChanged: string[]
+}
+
+export interface DiffInfo {
+  files: FileDiff[]
+  summary: {
+    added: number
+    modified: number
+    deleted: number
+  }
+}
+
+export interface FileDiff {
+  path: string
+  status: 'added' | 'modified' | 'deleted'
+  oldContent?: string
+  newContent?: string
+  diff: string
+}
+
+export interface TerminalSession {
+  sessionId: string
+  pid: number
+  status: 'active' | 'closed'
+  workingDir: string
 } 

@@ -1,15 +1,13 @@
 import {
   StreamEvent,
+  EventType,
+  ToolParameters,
+  ToolName,
+  ToolResult,
   RepositoryAnalysis,
   ImplementationPlan,
-  ToolResult,
-  ToolErrorEvent,
-  ToolName,
-  ToolParameters,
   FileInfo,
-  PlanStep,
-  PackageInfo,
-  GitHubPRResult,
+  PackageInfo
 } from '@/types'
 import { VirtualSandbox } from './mcp-sandbox'
 import { E2BSandbox } from './e2b-sandbox'
@@ -18,18 +16,23 @@ import { createPullRequestFromRepo } from './github/api'
 import { get } from '@/lib/config/env'
 import * as path from 'path'
 import { githubAPI } from './github/api'
+import { CodePilotError, ValidationError } from '@/lib/errors'
 
 export class McpAgent {
   private sandbox: VirtualSandbox | E2BSandbox
-  private openai: OpenAIClient
+  public openai: OpenAIClient
   private repoUrl: string
   private prompt: string
   private workDir: string
   private defaultBranch: string = 'main' // Will be detected during analysis
+  private verificationMode: boolean = false
+  private verificationSessionId?: string
+  private plan?: ImplementationPlan
 
-  constructor(repoUrl: string, prompt: string) {
+  constructor(repoUrl: string, prompt: string, verificationMode: boolean = false) {
     this.repoUrl = repoUrl
     this.prompt = prompt
+    this.verificationMode = verificationMode
     
     // Choose sandbox based on environment variable
     const useE2B = get('USE_E2B_SANDBOX') === 'true'
@@ -147,6 +150,7 @@ export class McpAgent {
       let plan: ImplementationPlan
       try {
         plan = yield* this.createPlan(this.prompt, analysis, allFiles)
+        this.plan = plan // Store the plan
         yield { type: 'plan', message: 'Implementation plan created.', timestamp: new Date().toISOString() }
         console.log('[AGENT] Plan created:', { filesToModify: plan.filesToModify, newFiles: plan.newFiles, approach: plan.approach })
       } catch (error) {
@@ -257,6 +261,26 @@ export class McpAgent {
         console.log('[AGENT] All changes already committed by autonomous implementation');
       }
       
+      // If verification mode is enabled, pause here for user review
+      if (this.verificationMode) {
+        this.verificationSessionId = `verify-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+        
+        yield {
+          type: 'pause_for_verification',
+          message: 'Changes implemented and committed. Pausing for user verification...',
+          timestamp: new Date().toISOString(),
+          data: {
+            sessionId: this.verificationSessionId,
+            branchName: branchName,
+            filesChanged: plan.filesToModify.concat(plan.newFiles),
+            repoPath: this.workDir,
+            sandboxId: this.sandbox instanceof E2BSandbox ? (this.sandbox as any).sandboxId : undefined
+          },
+          progress: 85
+        };
+        return; // Pause the generator, but DO NOT clean up the sandbox
+      }
+      
       // Push the changes
       console.log('[AGENT] Pushing changes to remote...')
       yield { type: 'progress', message: 'Pushing changes to GitHub...', timestamp: new Date().toISOString(), progress: 90 }
@@ -276,20 +300,13 @@ export class McpAgent {
       yield { type: 'pr_create', message: 'Creating pull request...', timestamp: new Date().toISOString() }
       
       try {
+        const { title, body } = await this.generatePrDetails()
         const prUrl = await this.createPullRequest(
           this.repoUrl,
           branchName,
           this.defaultBranch,
-          `Improve login and registration logic`,
-          `This PR enhances the login and registration functionality with better validation, error handling, and security features.
-
-## Changes:
-- Added form validation for login and registration
-- Improved error handling and user feedback
-- Enhanced security measures for authentication
-- Implemented more reliable form submission logic
-
-Requested by: Code Pilot Agent`
+          title,
+          body
         )
         
         yield { type: 'pr_created', message: `Pull request created: ${prUrl}`, timestamp: new Date().toISOString(), data: { url: prUrl } }
@@ -303,8 +320,8 @@ Requested by: Code Pilot Agent`
             prUrl: prUrl,
             prNumber: prUrl.split('/').pop(),
             branchName: branchName,
-            filesChanged: plan.filesToModify.length + plan.newFiles.length,
-            summary: plan.approach
+            filesChanged: (this.plan?.filesToModify.length ?? 0) + (this.plan?.newFiles.length ?? 0),
+            summary: this.plan?.approach ?? 'Changes verified and published by user'
           },
           progress: 100
         }
@@ -318,9 +335,232 @@ Requested by: Code Pilot Agent`
       console.error('[AGENT] Error occurred:', error)
       yield { type: 'error', message: `Agent failed: ${error.message}`, timestamp: new Date().toISOString() }
     } finally {
-      console.log('[AGENT] Cleaning up sandbox...')
-      await this.sandbox.cleanup()
+      // Only clean up the sandbox if we're not in verification mode
+      if (!this.verificationMode) {
+        console.log('[AGENT] Cleaning up sandbox...')
+        await this.sandbox.cleanup()
+      } else {
+        console.log('[AGENT] Keeping sandbox alive for verification...')
+      }
     }
+  }
+
+  /**
+   * Continue the agent flow after user verification
+   */
+  async *continueAfterVerification(branchName: string): AsyncGenerator<StreamEvent> {
+    if (!this.verificationSessionId) {
+      throw new Error('No verification session active');
+    }
+
+    try {
+      // Ensure the sandbox is still available
+      if (!this.sandbox) {
+        throw new Error('Sandbox is no longer available. The verification session may have expired.');
+      }
+
+      // Push the changes
+      console.log('[AGENT] Pushing changes to remote...')
+      yield { type: 'progress', message: 'Pushing changes to GitHub...', timestamp: new Date().toISOString(), progress: 90 }
+      
+      const pushResult = await this.runTool('git_push', {
+        branchName
+      })
+
+      if (!pushResult.success) {
+        throw new Error(`Failed to push changes: ${pushResult.error}`)
+      }
+      
+      // Create a PR
+      console.log('[AGENT] Push completed, creating PR...')
+      yield { type: 'progress', message: 'Creating pull request...', timestamp: new Date().toISOString(), progress: 95 }
+      
+      yield { type: 'pr_create', message: 'Creating pull request...', timestamp: new Date().toISOString() }
+      
+      try {
+        const { title, body } = await this.generatePrDetails()
+        const prUrl = await this.createPullRequest(
+          this.repoUrl,
+          branchName,
+          this.defaultBranch,
+          title,
+          body
+        )
+        
+        yield { type: 'pr_created', message: `Pull request created: ${prUrl}`, timestamp: new Date().toISOString(), data: { url: prUrl } }
+        
+        // Add a complete event for the UI
+      yield {
+        type: 'complete',
+          message: 'Task completed successfully!', 
+        timestamp: new Date().toISOString(),
+          data: { 
+            prUrl: prUrl,
+            prNumber: prUrl.split('/').pop(),
+            branchName: branchName,
+            filesChanged: this.plan?.filesToModify.length ?? 0 + this.plan?.newFiles.length ?? 0,
+            summary: this.plan?.approach ?? 'Changes verified and published by user'
+          },
+          progress: 100
+      }
+    } catch (error: any) {
+        console.error('[AGENT] PR creation failed:', error);
+        yield { type: 'error', message: `Failed to create PR: ${error.message}`, timestamp: new Date().toISOString() }
+      }
+    } catch (error: any) {
+      console.error('[AGENT] Error during verification continuation:', error)
+      yield { type: 'error', message: `Failed to continue after verification: ${error.message}`, timestamp: new Date().toISOString() }
+    } finally {
+      // Always clean up after continuation
+      console.log('[AGENT] Cleaning up sandbox after verification...')
+      await this.sandbox.cleanup()
+      this.verificationSessionId = undefined;
+    }
+  }
+
+  private async generatePrDetails(): Promise<{ title: string; body: string }> {
+    if (!this.plan) {
+      throw new Error("Plan is not available to generate PR details.");
+    }
+
+    const prPrompt = `
+      Based on the user's request and the implementation approach, generate a concise and descriptive Pull Request title and a markdown-formatted body.
+
+      User Request: "${this.prompt}"
+
+      Implementation Approach: "${this.plan.approach}"
+
+      Files Modified:
+      ${this.plan.filesToModify.map(f => `- \`${f}\``).join('\n')}
+      
+      New Files:
+      ${this.plan.newFiles.map(f => `- \`${f}\``).join('\n')}
+
+      Return ONLY a JSON object with this structure:
+      {
+        "title": "A short, descriptive PR title starting with a verb (e.g., 'Feat:', 'Fix:', 'Refactor:')",
+        "body": "A markdown-formatted PR body. Include a short summary of the changes and a bulleted list of key modifications. Be professional and clear."
+      }
+    `;
+
+    try {
+      const result = await this.openai.generateCode(prPrompt);
+      if (!result.code) {
+        throw new Error("AI did not return any code for the PR details.");
+      }
+      return JSON.parse(result.code);
+    } catch (error) {
+      console.error('[AGENT] Failed to generate PR details, using fallback.', error);
+      const approach = this.plan?.approach ?? "The AI agent's plan was not available.";
+      return {
+        title: `Feat: Apply AI-generated changes for task: ${this.prompt.slice(0, 50)}`,
+        body: `This pull request was generated by an AI agent based on the following prompt:\n\n> ${this.prompt}\n\n**Implementation Approach:**\n${approach}`
+      };
+    }
+  }
+
+  /**
+   * Get verification session ID
+   */
+  getVerificationSessionId(): string | undefined {
+    return this.verificationSessionId;
+  }
+
+  /**
+   * Get verification session info for external access
+   */
+  async getVerificationSession() {
+    return {
+      sessionId: this.verificationSessionId,
+      sandbox: this.sandbox,
+      workDir: this.workDir,
+      isActive: !!this.verificationSessionId,
+      branchName: this.sandbox ? await this.getCurrentBranch() : undefined
+    }
+  }
+  
+  /**
+   * Get current git branch
+   */
+  private async getCurrentBranch(): Promise<string> {
+    try {
+      const result = await this.executeCommand('git branch --show-current');
+      return result.stdout.trim() || 'main';
+    } catch (error) {
+      console.error('[AGENT] Failed to get current branch:', error);
+      return 'main';
+    }
+  }
+
+  /**
+   * Get diff of current changes
+   */
+  async getDiff(): Promise<string> {
+    try {
+      // First try to get the diff from committed changes
+      const committedResult = await this.executeCommand('git diff HEAD~1');
+      if (committedResult.stdout.trim()) {
+        return committedResult.stdout;
+      }
+      
+      // Then try to get the diff from staged changes
+      const stagedResult = await this.executeCommand('git diff --cached');
+      if (stagedResult.stdout.trim()) {
+        return stagedResult.stdout;
+      }
+      
+      // Finally, try to get the diff from unstaged changes
+      const unstagedResult = await this.executeCommand('git diff');
+      if (unstagedResult.stdout.trim()) {
+        return unstagedResult.stdout;
+      }
+      
+      // If all else fails, show the status
+      const statusResult = await this.executeCommand('git status');
+      return statusResult.stdout || 'No changes detected';
+    } catch (error: any) {
+      console.error('[AGENT] Failed to get diff:', error);
+      return `Error getting diff: ${error.message}`;
+    }
+  }
+
+  /**
+   * Execute shell command in the sandbox (for terminal access)
+   */
+  async executeCommand(command: string): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+    try {
+      const result = await this.sandbox.callTool('execute_shell', {
+        command
+      });
+      
+      if (result.success) {
+        return {
+          stdout: result.stdout || '',
+          stderr: result.stderr || '',
+          exitCode: 0
+        };
+      } else {
+        return {
+          stdout: '',
+          stderr: result.error || 'Command failed',
+          exitCode: 1
+        };
+      }
+    } catch (error: any) {
+      return {
+        stdout: '',
+        stderr: error.message,
+        exitCode: 1
+      };
+    }
+  }
+
+  /**
+   * Cleanup verification session
+   */
+  async cleanupVerification() {
+    this.verificationSessionId = undefined;
+    await this.sandbox.cleanup();
   }
 
   private async *cloneRepository(url: string, destination: string): AsyncGenerator<StreamEvent, ToolResult> {
@@ -328,7 +568,8 @@ Requested by: Code Pilot Agent`
     const useE2B = get('USE_E2B_SANDBOX') === 'true'
     const params = useE2B ? { url, destination: '.' } : { url, destination }
     
-    return yield* this.runTool('clone_repository', params, 'Repository cloned successfully.')
+    const result = await this.runTool('clone_repository', params, 'Repository cloned successfully.')
+    return result
   }
 
   /**
@@ -545,16 +786,16 @@ Focus on:
     } catch (error) {
       console.log('[AGENT] Could not detect default branch, using "main"');
     }
-
-    const analysis: RepositoryAnalysis = {
-      totalFiles: allFiles.length,
+      
+      const analysis: RepositoryAnalysis = {
+        totalFiles: allFiles.length,
       languages,
       structure: this.summarizeStructure(allFiles),
       keyFiles: intelligentAnalysis.keyFiles,
       dependencies,
       framework,
       packageManager,
-      projectRoot,
+        projectRoot,
       // Add new intelligent analysis fields
       projectType: intelligentAnalysis.projectType,
       backendFiles: intelligentAnalysis.backendFiles,
@@ -571,9 +812,9 @@ Focus on:
     });
 
     yield { type: 'analyze', message: 'Repository analysis complete.', timestamp: new Date().toISOString() }
-    return { analysis, allFiles }
-  }
-
+      return { analysis, allFiles }
+    }
+    
   private detectLanguages(files: FileInfo[]): Record<string, number> {
     const languages: Record<string, number> = {}
     
@@ -842,21 +1083,25 @@ The repository is on branch 'codepilot/${Date.now()}' and you need to implement 
 
 You have access to these tools: list_files, read_file, write_file, git_add, git_status, git_commit
 
-CRITICAL WORKFLOW:
-1. First, use list_files to understand the structure (1 call max)
-2. Use read_file to read relevant files (2-3 calls max)
-3. Use write_file to modify files based on the user's request
-4. Use git_add to stage your changes
-5. Use git_commit to commit your changes
-6. STOP when changes are committed
+**Plan:**
+-   **Approach:** ${plan.approach}
+-   **Files to Modify:** ${plan.filesToModify.join(', ')}
 
-RULES:
-- Do NOT read the same file multiple times unless you've written to it
-- Make meaningful changes - don't just read files repeatedly
-- Use relative paths from the repository root (e.g., "Backend/app.py")
-- After making changes, ALWAYS use git_add and git_commit
-- The user's request: "${prompt}"
-- Stop after successfully committing changes
+**Workflow Rules:**
+1.  **Analyze:** Use \`list_files\` and \`read_file\` to understand the current state of the code you need to modify. You can read each file only once.
+2.  **Implement:** Use \`write_file\` to apply the changes to a file.
+3.  **Verify & Commit:** After writing, use \`git_add\` to stage your changes, then \`git_commit\` with a descriptive message to save your work. You must commit after each logical change.
+
+**CRITICAL INSTRUCTIONS for the \`write_file\` tool:**
+-   The \`write_file\` tool will completely overwrite the target file. 
+-   You **MUST** provide the **ENTIRE, UNMODIFIED ORIGINAL FILE CONTENT**, with your new code or changes seamlessly integrated.
+-   Any part of the original code you do not include will be **PERMANENTLY DELETED**.
+-   For a task like "add comments" or "add a function", your primary goal is to preserve all existing code and logic perfectly, while only adding the requested new content.
+-   Review your generated content for \`write_file\` before calling the tool to ensure you have not accidentally removed any part of the original file. This is the most common and most serious error.
+
+**IMPORTANT:**
+-   **Adhere strictly to the plan.** Do not modify files not listed in the plan.
+-   **Be efficient.** Do not use more tool calls than necessary. A typical flow is: read -> write -> add -> commit.
 
 Start by listing files to understand the structure, then read and modify the relevant files.`
 
@@ -1113,7 +1358,7 @@ Start by listing files to understand the structure, then read and modify the rel
           operation: 'completed',
           status: 'failed',
           error: error.message
-        }
+      }
       }
       
       throw error

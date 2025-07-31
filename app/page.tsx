@@ -20,6 +20,7 @@ import {
   FileCode,
   GitPullRequest,
   Zap,
+  Settings,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { StreamEvent } from "@/types"
@@ -69,6 +70,9 @@ export default function CodePilotUI() {
   const [error, setError] = useState<string | null>(null)
   const [prUrl, setPrUrl] = useState<string | null>(null)
   const [events, setEvents] = useState<StreamEvent[]>([])
+  const [verificationMode, setVerificationMode] = useState(false)
+  const [verificationData, setVerificationData] = useState<any>(null)
+  const [showVerificationUI, setShowVerificationUI] = useState(false)
 
   const isValidRepo = repoUrl.includes("github.com") && repoUrl.includes("/")
   const charCount = prompt.length
@@ -83,12 +87,14 @@ export default function CodePilotUI() {
     setEvents([]);
     setError(null);
     setPrUrl(null);
+    setVerificationData(null);
+    setShowVerificationUI(false);
 
     try {
       const response = await fetch('/api/code', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ repoUrl, prompt }),
+        body: JSON.stringify({ repoUrl, prompt, verificationMode }),
       });
 
       if (!response.ok) {
@@ -131,6 +137,14 @@ export default function CodePilotUI() {
                 if (eventData.data?.prUrl) {
                   setPrUrl(eventData.data.prUrl);
                 }
+                break;
+              }
+
+              if (eventData.type === 'pause_for_verification') {
+                console.log('[FRONTEND] Pausing for verification:', eventData.data);
+                setVerificationData(eventData.data);
+                setShowVerificationUI(true);
+                setIsProcessing(false); // Allow user interaction
                 break;
               }
 
@@ -269,6 +283,53 @@ export default function CodePilotUI() {
                         </CardContent>
                       </Card>
                     ))}
+                  </div>
+                </div>
+              </CardContent>
+            </Card>
+
+            {/* Verification Mode Toggle */}
+            <Card className="bg-slate-800/50 border-slate-700">
+              <CardContent className="p-6">
+                <div className="space-y-4">
+                  <div className="flex items-center gap-2">
+                    <Settings className="w-4 h-4 text-slate-400" />
+                    <label className="text-sm font-medium text-white">Workflow Options</label>
+                  </div>
+                  <div className="space-y-3">
+                    <div className="flex items-center justify-between">
+                      <div className="space-y-1">
+                        <div className="flex items-center gap-2">
+                          <input
+                            type="radio"
+                            id="auto-publish"
+                            name="workflow"
+                            checked={!verificationMode}
+                            onChange={() => setVerificationMode(false)}
+                            className="w-4 h-4 text-blue-500 bg-slate-900 border-slate-600 focus:ring-blue-500"
+                          />
+                          <label htmlFor="auto-publish" className="text-sm text-white">Auto-publish PR</label>
+                        </div>
+                        <p className="text-xs text-slate-400 ml-6">Automatically create and publish pull request</p>
+                      </div>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <div className="space-y-1">
+                        <div className="flex items-center gap-2">
+                          <input
+                            type="radio"
+                            id="verify-mode"
+                            name="workflow"
+                            checked={verificationMode}
+                            onChange={() => setVerificationMode(true)}
+                            className="w-4 h-4 text-blue-500 bg-slate-900 border-slate-600 focus:ring-blue-500"
+                          />
+                          <label htmlFor="verify-mode" className="text-sm text-white">Review before publishing</label>
+                          <Badge variant="secondary" className="text-xs">Recommended</Badge>
+                        </div>
+                        <p className="text-xs text-slate-400 ml-6">Review changes in terminal before creating PR</p>
+                      </div>
+                    </div>
                   </div>
                 </div>
               </CardContent>
@@ -448,6 +509,128 @@ export default function CodePilotUI() {
                        <CardContent className="p-4">
                          <h4 className="font-semibold text-red-400">An Error Occurred</h4>
                          <p className="text-sm text-slate-400">{error}</p>
+                      </CardContent>
+                    </Card>
+                  )}
+
+                  {/* Verification UI */}
+                  {showVerificationUI && verificationData && (
+                    <Card className="bg-yellow-500/10 border-yellow-500/20">
+                      <CardContent className="p-6">
+                        <div className="space-y-4">
+                          <div className="flex items-center gap-3">
+                            <div className="w-10 h-10 bg-yellow-500 rounded-full flex items-center justify-center">
+                              <Terminal className="w-5 h-5 text-white" />
+                            </div>
+                            <div>
+                              <h4 className="font-semibold text-yellow-400">Ready for Verification</h4>
+                              <p className="text-sm text-slate-400">Review changes before publishing PR</p>
+                            </div>
+                          </div>
+
+                          <div className="space-y-3">
+                            <div className="text-sm text-slate-300">
+                              <p><strong>Branch:</strong> {verificationData.branchName}</p>
+                              <p><strong>Files Changed:</strong> {verificationData.filesChanged.length}</p>
+                            </div>
+
+                            <div className="grid grid-cols-2 gap-2">
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                className="border-yellow-500 text-yellow-400 bg-transparent hover:bg-yellow-500/10"
+                                onClick={() => window.open(`/verification?sessionId=${verificationData.sessionId}`, '_blank')}
+                              >
+                                <Terminal className="w-3 h-3 mr-2" />
+                                Open Terminal
+                              </Button>
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                className="border-blue-500 text-blue-400 bg-transparent hover:bg-blue-500/10"
+                                onClick={() => window.open(`/diff?sessionId=${verificationData.sessionId}`, '_blank')}
+                              >
+                                <FileCode className="w-3 h-3 mr-2" />
+                                View Diff
+                              </Button>
+                            </div>
+
+                            <Button
+                              className="w-full bg-green-500 hover:bg-green-600 text-white"
+                              onClick={async () => {
+                                try {
+                                  setIsProcessing(true);
+                                  setShowVerificationUI(false);
+                                  
+                                  const response = await fetch('/api/publish', {
+                                    method: 'POST',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({
+                                      sessionId: verificationData.sessionId,
+                                      branchName: verificationData.branchName
+                                    })
+                                  });
+
+                                  if (!response.ok) {
+                                    throw new Error('Failed to publish PR');
+                                  }
+
+                                  // Handle SSE response
+                                  const reader = response.body?.getReader();
+                                  const decoder = new TextDecoder();
+                                  
+                                  if (reader) {
+                                    while (true) {
+                                      const { value, done } = await reader.read();
+                                      if (done) break;
+                                      
+                                      const chunk = decoder.decode(value);
+                                      const lines = chunk.split('\n');
+                                      
+                                      for (const line of lines) {
+                                        if (line.startsWith('data: ')) {
+                                          try {
+                                            const eventData = JSON.parse(line.slice(6));
+                                            setEvents(prev => [...prev, eventData]);
+                                            
+                                            if (eventData.type === 'complete') {
+                                              setIsComplete(true);
+                                              setIsProcessing(false);
+                                              if (eventData.data?.prUrl) {
+                                                setPrUrl(eventData.data.prUrl);
+                                              }
+                                            } else if (eventData.type === 'error') {
+                                              setError(eventData.message);
+                                              setIsProcessing(false);
+                                            }
+                                          } catch (e) {
+                                            console.error('Failed to parse publish event:', e);
+                                          }
+                                        }
+                                      }
+                                    }
+                                  }
+                                } catch (error: any) {
+                                  setError(error.message);
+                                  setIsProcessing(false);
+                                }
+                              }}
+                              disabled={isProcessing}
+                            >
+                              {isProcessing ? (
+                                <>
+                                  <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                                  Publishing PR...
+                                </>
+                              ) : (
+                                <>
+                                  <GitPullRequest className="w-4 h-4 mr-2" />
+                                  Publish PR
+                                </>
+                              )}
+                            </Button>
+                          </div>
+                        </div>
                       </CardContent>
                     </Card>
                   )}
