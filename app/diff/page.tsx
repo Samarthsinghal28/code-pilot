@@ -1,10 +1,11 @@
 "use client"
 
+import { Suspense } from 'react'
 import { useEffect, useState } from 'react'
 import { useSearchParams } from 'next/navigation'
 import { DiffInfo, FileDiff } from '@/types'
 
-export default function DiffPage() {
+function DiffPageContent() {
   const searchParams = useSearchParams()
   const sessionId = searchParams.get('sessionId')
   const [loading, setLoading] = useState(true)
@@ -121,14 +122,6 @@ export default function DiffPage() {
       <div className="max-w-6xl mx-auto">
         <div className="flex justify-between items-center mb-4">
           <h1 className="text-2xl font-bold">Code Changes</h1>
-          <div className="flex gap-2">
-            <button
-              onClick={handleOpenTerminal}
-              className="px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded text-white"
-            >
-              Open Terminal
-            </button>
-          </div>
         </div>
         
         {error && (
@@ -202,5 +195,13 @@ export default function DiffPage() {
         </div>
       </div>
     </div>
+  )
+}
+
+export default function DiffPage() {
+  return (
+    <Suspense fallback={<div className="min-h-screen bg-gray-900 text-white flex justify-center items-center"><div className="animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-blue-500"></div></div>}>
+      <DiffPageContent />
+    </Suspense>
   )
 } 

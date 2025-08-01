@@ -1,12 +1,12 @@
 "use client"
 
-import { useEffect, useRef, useState } from 'react'
+import { Suspense, useEffect, useRef, useState } from 'react'
 import { useSearchParams } from 'next/navigation'
 import { Terminal } from 'xterm'
 import { FitAddon } from 'xterm-addon-fit'
 import 'xterm/css/xterm.css'
 
-export default function VerificationPage() {
+function VerificationPageContent() {
   const searchParams = useSearchParams()
   const sessionId = searchParams.get('sessionId')
   const [connected, setConnected] = useState(false)
@@ -36,7 +36,6 @@ export default function VerificationPage() {
             background: '#1e1e2e',
             foreground: '#f8f8f2',
             cursor: '#f8f8f2',
-            selection: 'rgba(248, 248, 242, 0.3)',
             black: '#21222c',
             red: '#ff5555',
             green: '#50fa7b',
@@ -228,5 +227,13 @@ export default function VerificationPage() {
         </div>
       </div>
     </div>
+  )
+}
+
+export default function VerificationPage() {
+  return (
+    <Suspense fallback={<div className="min-h-screen bg-gray-900 text-white flex justify-center items-center"><div className="animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-blue-500"></div></div>}>
+      <VerificationPageContent />
+    </Suspense>
   )
 } 

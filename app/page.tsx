@@ -21,6 +21,7 @@ import {
   GitPullRequest,
   Zap,
   Settings,
+  GitMerge,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { StreamEvent } from "@/types"
@@ -538,22 +539,13 @@ export default function CodePilotUI() {
                               <Button
                                 variant="outline"
                                 size="sm"
-                                className="border-yellow-500 text-yellow-400 bg-transparent hover:bg-yellow-500/10"
-                                onClick={() => window.open(`/verification?sessionId=${verificationData.sessionId}`, '_blank')}
-                              >
-                                <Terminal className="w-3 h-3 mr-2" />
-                                Open Terminal
-                              </Button>
-                              <Button
-                                variant="outline"
-                                size="sm"
                                 className="border-blue-500 text-blue-400 bg-transparent hover:bg-blue-500/10"
                                 onClick={() => window.open(`/diff?sessionId=${verificationData.sessionId}`, '_blank')}
                               >
-                                <FileCode className="w-3 h-3 mr-2" />
+                                <GitMerge className="w-3 h-3 mr-2" />
                                 View Diff
                               </Button>
-                               <Button
+                              <Button
                                 variant="outline"
                                 size="sm"
                                 className="border-green-500 text-green-400 bg-transparent hover:bg-green-500/10"
