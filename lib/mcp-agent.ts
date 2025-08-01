@@ -11,6 +11,7 @@ import {
 } from '@/types'
 import { VirtualSandbox } from './mcp-sandbox'
 import { E2BSandbox } from './e2b-sandbox'
+import { SandboxManager } from './sandbox-manager'
 import { OpenAIClient } from './llm/openai'
 import { createPullRequestFromRepo } from './github/api'
 import { get } from '@/lib/config/env'
@@ -24,21 +25,23 @@ export class McpAgent {
   private repoUrl: string
   private prompt: string
   private workDir: string
-  private defaultBranch: string = 'main' // Will be detected during analysis
+  private defaultBranch: string = 'main'
   private verificationMode: boolean = false
   private verificationSessionId?: string
   private plan?: ImplementationPlan
+  private sessionId: string
 
   constructor(repoUrl: string, prompt: string, verificationMode: boolean = false) {
     this.repoUrl = repoUrl
     this.prompt = prompt
     this.verificationMode = verificationMode
+    this.sessionId = `session-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`
     
-    // Choose sandbox based on environment variable
     const useE2B = get('USE_E2B_SANDBOX') === 'true'
     
     if (useE2B) {
       this.sandbox = new E2BSandbox()
+      SandboxManager.getInstance().registerSandbox(this.sessionId, this.sandbox as E2BSandbox)
       this.workDir = this.sandbox.getWorkingDirectory()
     } else {
       this.workDir = path.join(process.cwd(), 'tmp', `agent-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`)
@@ -56,7 +59,6 @@ export class McpAgent {
     }
 
     try {
-      // Try execute_shell first (works with E2B), fallback to git status
       let result: any;
       
       try {
@@ -65,7 +67,6 @@ export class McpAgent {
         });
       } catch (error: any) {
         console.error('[AGENT] git_status failed:', error);
-        // If git_status fails, assume there are changes
         yield {
           type: 'debug',
           message: 'Could not check git status, assuming changes exist',
@@ -90,7 +91,6 @@ export class McpAgent {
         return hasChanges;
       }
       
-      // Fallback to assuming changes exist if we couldn't determine status
       yield {
         type: 'debug',
         message: 'Could not determine git status, assuming changes exist',
@@ -99,7 +99,6 @@ export class McpAgent {
       return true;
     } catch (error: any) {
       console.error('[AGENT] Failed to check for changes:', error)
-      // If all methods fail, assume changes were made to be safe
       yield {
         type: 'debug',
         message: 'Could not reliably check for changes, assuming changes were made',
@@ -110,21 +109,16 @@ export class McpAgent {
     }
   }
 
-  /**
-   * Main agent execution loop
-   */
   async *run(): AsyncGenerator<StreamEvent> {
     yield { type: 'start', message: 'Code Pilot agent starting...', timestamp: new Date().toISOString() }
     
     try {
       console.log('[AGENT] Starting agent with:', { repoUrl: this.repoUrl, prompt: this.prompt })
 
-      // Initialize sandbox
       await this.sandbox.initialize()
       yield { type: 'sandbox_create', message: 'Secure sandbox environment created', timestamp: new Date().toISOString() }
       console.log('[AGENT] Sandbox initialized')
       
-      // Clone repository
       console.log('[AGENT] Starting repository clone...')
       yield { type: 'progress', message: 'Cloning repository...', timestamp: new Date().toISOString(), progress: 10 }
       
@@ -142,22 +136,19 @@ export class McpAgent {
       console.log('[AGENT] Clone completed, starting analysis...')
       yield { type: 'progress', message: 'Repository cloned, analyzing structure...', timestamp: new Date().toISOString(), progress: 20 }
 
-      // Analyze repository
       const { analysis, allFiles } = yield* this.analyzeRepository(repoDir)
       yield { type: 'analysis_update', message: `Repository analysis complete: ${analysis.totalFiles} files found`, timestamp: new Date().toISOString(), progress: 40 }
       
-      // Create implementation plan
       let plan: ImplementationPlan
       try {
         plan = yield* this.createPlan(this.prompt, analysis, allFiles)
-        this.plan = plan // Store the plan
+        this.plan = plan 
         yield { type: 'plan', message: 'Implementation plan created.', timestamp: new Date().toISOString() }
         console.log('[AGENT] Plan created:', { filesToModify: plan.filesToModify, newFiles: plan.newFiles, approach: plan.approach })
       } catch (error) {
         console.error('[AGENT] Planning failed:', error)
         yield { type: 'plan', message: 'Created fallback plan due to planning error.', timestamp: new Date().toISOString() }
         
-        // Create a fallback plan focused on the most likely files
         plan = {
           approach: `Implement: ${this.prompt}`,
           filesToModify: [],
@@ -168,7 +159,6 @@ export class McpAgent {
           technologies: []
         }
         
-        // Look for login and registration related files
         const loginFiles = allFiles.filter(f => 
           (f.path.includes('login') || f.path.includes('register') || f.path.includes('auth')) && 
           (f.path.endsWith('.js') || f.path.endsWith('.jsx') || f.path.endsWith('.ts') || f.path.endsWith('.tsx'))
@@ -178,7 +168,6 @@ export class McpAgent {
           plan.filesToModify = loginFiles
           console.log('[AGENT] Created fallback plan with login/registration files:', loginFiles)
         } else {
-          // If no login files found, use some common source files
           plan.filesToModify = allFiles.filter(f => 
             f.path.includes('/src/') && 
             (f.path.endsWith('.js') || f.path.endsWith('.jsx') || f.path.endsWith('.ts') || f.path.endsWith('.tsx'))
@@ -193,15 +182,13 @@ export class McpAgent {
         progress: 50
       }
       
-      // Create a branch for our changes
       const branchName = `codepilot/${Date.now()}`
       console.log('[AGENT] Creating branch:', branchName)
       
-      // Create the branch
       console.log('[AGENT] Creating branch:', branchName)
       yield { type: 'progress', message: 'Creating feature branch...', timestamp: new Date().toISOString(), progress: 80 }
 
-              const branchResult = await this.runTool('git_branch', {
+      const branchResult = await this.runTool('git_branch', {
           branchName
         })
 
@@ -209,8 +196,7 @@ export class McpAgent {
         throw new Error(`Failed to create branch: ${branchResult.error}`)
       }
 
-              // Extract current branch info from the git branch output logs for PR base
-        if (typeof branchResult.data === 'string' && branchResult.data.includes('CURRENT_BRANCH:')) {
+      if (typeof branchResult.data === 'string' && branchResult.data.includes('CURRENT_BRANCH:')) {
           const branchMatch = branchResult.data.match(/CURRENT_BRANCH:\s*(\w+)/);
           if (branchMatch) {
             this.defaultBranch = branchMatch[1];
@@ -218,7 +204,6 @@ export class McpAgent {
           }
         }
 
-      // Implement the changes
       yield { type: 'progress', message: 'Implementing changes...', timestamp: new Date().toISOString(), progress: 60 }
       yield* this.implementPlan(plan, this.prompt, repoDir, analysis.projectRoot)
       console.log('[AGENT] Implementation completed')
@@ -230,11 +215,9 @@ export class McpAgent {
         progress: 85
       }
 
-      // Check if there are any uncommitted changes left
       const hasChanges = yield* this.checkForChanges();
       
       if (hasChanges) {
-        // Stage all changes
         yield { type: 'tool_call', message: 'Staging changes...', timestamp: new Date().toISOString() }
         const addResult = await this.runTool('git_add', {
           files: ['.'],
@@ -245,7 +228,6 @@ export class McpAgent {
           throw new Error(`Failed to stage changes: ${addResult.error}`);
         }
         
-        // Commit the changes
         yield { type: 'tool_call', message: 'Committing changes...', timestamp: new Date().toISOString() }
         const commitResult = await this.runTool('git_commit', {
           message: `Improved login and registration logic\n\nEnhanced the login and registration components with better validation, error handling, and security features.`,
@@ -261,9 +243,8 @@ export class McpAgent {
         console.log('[AGENT] All changes already committed by autonomous implementation');
       }
       
-      // If verification mode is enabled, pause here for user review
       if (this.verificationMode) {
-        this.verificationSessionId = `verify-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+        this.verificationSessionId = this.sessionId;
         
         yield {
           type: 'pause_for_verification',
@@ -278,10 +259,9 @@ export class McpAgent {
           },
           progress: 85
         };
-        return; // Pause the generator, but DO NOT clean up the sandbox
+        return; 
       }
       
-      // Push the changes
       console.log('[AGENT] Pushing changes to remote...')
       yield { type: 'progress', message: 'Pushing changes to GitHub...', timestamp: new Date().toISOString(), progress: 90 }
       
@@ -293,7 +273,6 @@ export class McpAgent {
         throw new Error(`Failed to push changes: ${pushResult.error}`)
       }
       
-      // Create a PR
       console.log('[AGENT] Push completed, creating PR...')
       yield { type: 'progress', message: 'Creating pull request...', timestamp: new Date().toISOString(), progress: 95 }
       
@@ -311,7 +290,6 @@ export class McpAgent {
         
         yield { type: 'pr_created', message: `Pull request created: ${prUrl}`, timestamp: new Date().toISOString(), data: { url: prUrl } }
         
-        // Add a complete event for the UI
       yield {
         type: 'complete',
           message: 'Task completed successfully!', 
@@ -335,7 +313,6 @@ export class McpAgent {
       console.error('[AGENT] Error occurred:', error)
       yield { type: 'error', message: `Agent failed: ${error.message}`, timestamp: new Date().toISOString() }
     } finally {
-      // Only clean up the sandbox if we're not in verification mode
       if (!this.verificationMode) {
         console.log('[AGENT] Cleaning up sandbox...')
         await this.sandbox.cleanup()
@@ -345,21 +322,16 @@ export class McpAgent {
     }
   }
 
-  /**
-   * Continue the agent flow after user verification
-   */
   async *continueAfterVerification(branchName: string): AsyncGenerator<StreamEvent> {
     if (!this.verificationSessionId) {
       throw new Error('No verification session active');
     }
+    this.sessionId = this.verificationSessionId
 
     try {
-      // Ensure the sandbox is still available
-      if (!this.sandbox) {
-        throw new Error('Sandbox is no longer available. The verification session may have expired.');
-      }
+      const sandbox = await SandboxManager.getInstance().getSandbox(this.sessionId)
+      this.sandbox = sandbox
 
-      // Push the changes
       console.log('[AGENT] Pushing changes to remote...')
       yield { type: 'progress', message: 'Pushing changes to GitHub...', timestamp: new Date().toISOString(), progress: 90 }
       
@@ -371,7 +343,6 @@ export class McpAgent {
         throw new Error(`Failed to push changes: ${pushResult.error}`)
       }
       
-      // Create a PR
       console.log('[AGENT] Push completed, creating PR...')
       yield { type: 'progress', message: 'Creating pull request...', timestamp: new Date().toISOString(), progress: 95 }
       
@@ -389,7 +360,6 @@ export class McpAgent {
         
         yield { type: 'pr_created', message: `Pull request created: ${prUrl}`, timestamp: new Date().toISOString(), data: { url: prUrl } }
         
-        // Add a complete event for the UI
       yield {
         type: 'complete',
           message: 'Task completed successfully!', 
@@ -398,7 +368,7 @@ export class McpAgent {
             prUrl: prUrl,
             prNumber: prUrl.split('/').pop(),
             branchName: branchName,
-            filesChanged: this.plan?.filesToModify.length ?? 0 + this.plan?.newFiles.length ?? 0,
+            filesChanged: (this.plan?.filesToModify.length ?? 0) + (this.plan?.newFiles.length ?? 0),
             summary: this.plan?.approach ?? 'Changes verified and published by user'
           },
           progress: 100
@@ -411,7 +381,6 @@ export class McpAgent {
       console.error('[AGENT] Error during verification continuation:', error)
       yield { type: 'error', message: `Failed to continue after verification: ${error.message}`, timestamp: new Date().toISOString() }
     } finally {
-      // Always clean up after continuation
       console.log('[AGENT] Cleaning up sandbox after verification...')
       await this.sandbox.cleanup()
       this.verificationSessionId = undefined;
@@ -444,7 +413,7 @@ export class McpAgent {
     `;
 
     try {
-      const result = await this.openai.generateCode(prPrompt);
+      const result = await this.openai.generateCode(prPrompt, '', '');
       if (!result.code) {
         throw new Error("AI did not return any code for the PR details.");
       }
@@ -459,16 +428,10 @@ export class McpAgent {
     }
   }
 
-  /**
-   * Get verification session ID
-   */
   getVerificationSessionId(): string | undefined {
     return this.verificationSessionId;
   }
 
-  /**
-   * Get verification session info for external access
-   */
   async getVerificationSession() {
     return {
       sessionId: this.verificationSessionId,
@@ -479,9 +442,6 @@ export class McpAgent {
     }
   }
   
-  /**
-   * Get current git branch
-   */
   private async getCurrentBranch(): Promise<string> {
     try {
       const result = await this.executeCommand('git branch --show-current');
@@ -492,30 +452,23 @@ export class McpAgent {
     }
   }
 
-  /**
-   * Get diff of current changes
-   */
   async getDiff(): Promise<string> {
     try {
-      // First try to get the diff from committed changes
       const committedResult = await this.executeCommand('git diff HEAD~1');
       if (committedResult.stdout.trim()) {
         return committedResult.stdout;
       }
       
-      // Then try to get the diff from staged changes
       const stagedResult = await this.executeCommand('git diff --cached');
       if (stagedResult.stdout.trim()) {
         return stagedResult.stdout;
       }
       
-      // Finally, try to get the diff from unstaged changes
       const unstagedResult = await this.executeCommand('git diff');
       if (unstagedResult.stdout.trim()) {
         return unstagedResult.stdout;
       }
       
-      // If all else fails, show the status
       const statusResult = await this.executeCommand('git status');
       return statusResult.stdout || 'No changes detected';
     } catch (error: any) {
@@ -524,9 +477,6 @@ export class McpAgent {
     }
   }
 
-  /**
-   * Execute shell command in the sandbox (for terminal access)
-   */
   async executeCommand(command: string): Promise<{ stdout: string; stderr: string; exitCode: number }> {
     try {
       const result = await this.sandbox.callTool('execute_shell', {
@@ -555,16 +505,12 @@ export class McpAgent {
     }
   }
 
-  /**
-   * Cleanup verification session
-   */
   async cleanupVerification() {
     this.verificationSessionId = undefined;
     await this.sandbox.cleanup();
   }
 
   private async *cloneRepository(url: string, destination: string): AsyncGenerator<StreamEvent, ToolResult> {
-    // For E2B sandbox, we don't need to specify destination as it handles its own path
     const useE2B = get('USE_E2B_SANDBOX') === 'true'
     const params = useE2B ? { url, destination: '.' } : { url, destination }
     
@@ -572,9 +518,6 @@ export class McpAgent {
     return result
   }
 
-  /**
-   * Use LLM to intelligently analyze repository structure and identify key components
-   */
   private async analyzeRepositoryWithLLM(allFiles: FileInfo[]): Promise<{
     projectType: string;
     primaryLanguages: string[];
@@ -585,7 +528,6 @@ export class McpAgent {
     configFiles: string[];
     analysisNotes: string;
   }> {
-    // Sample representative files for LLM analysis (avoid overwhelming with too many files)
     const sampleFiles = allFiles
       .filter(f => !f.path.includes('node_modules') && !f.path.includes('.git'))
       .slice(0, 50)
@@ -631,13 +573,9 @@ Focus on:
       console.error('[AGENT] LLM repository analysis failed:', error);
     }
 
-    // Fallback to basic analysis
     return this.fallbackRepositoryAnalysis(allFiles);
   }
 
-  /**
-   * Fallback repository analysis when LLM analysis fails
-   */
   private fallbackRepositoryAnalysis(allFiles: FileInfo[]): {
     projectType: string;
     primaryLanguages: string[];
@@ -667,7 +605,6 @@ Focus on:
         directories.add(dir.split('/')[0]);
       }
 
-      // Basic categorization
       if (file.path.match(/\.(py|java|go|rs|php|rb)$/)) {
         backendFiles.push(file.path);
       } else if (file.path.match(/\.(js|jsx|ts|tsx|vue|html|css)$/) && 
@@ -699,7 +636,6 @@ Focus on:
     yield { type: 'analyze', message: 'Analyzing repository...', timestamp: new Date().toISOString() }
     console.log('[AGENT] Starting repository analysis for directory:', repoDir)
     
-    // Step 1: List all files
     const listResult = await this.sandbox.callTool('list_files', { path: '.', recursive: true })
     if (!listResult.success || !listResult.data.files) {
       throw new Error('Failed to list files in the repository.')
@@ -707,11 +643,9 @@ Focus on:
     const allFiles: FileInfo[] = listResult.data.files
     console.log(`[AGENT] Found ${allFiles.length} files.`)
 
-    // Step 2: Use LLM to intelligently analyze the repository
     yield { type: 'analyze', message: 'Performing intelligent repository analysis...', timestamp: new Date().toISOString() }
     const intelligentAnalysis = await this.analyzeRepositoryWithLLM(allFiles);
     
-    // Step 3: Detect project root based on LLM analysis and config files
     let projectRoot = '.';
     const rootCandidates = intelligentAnalysis.configFiles
       .map(f => path.dirname(f))
@@ -723,12 +657,10 @@ Focus on:
     }
     console.log(`[AGENT] Detected project root at: ${projectRoot}`);
 
-    // Step 4: Try to detect framework/dependencies from primary config files
     let dependencies: PackageInfo[] = [];
     let framework = '';
     let packageManager: 'npm' | 'yarn' | 'pnpm' | 'bun' | undefined = undefined;
 
-    // Try to read the main package.json if it exists
     const mainPackageJson = intelligentAnalysis.configFiles.find(f => f.endsWith('package.json') && !f.includes('node_modules'));
     if (mainPackageJson) {
       const readResult = await this.sandbox.callTool('read_file', { path: mainPackageJson });
@@ -742,14 +674,12 @@ Focus on:
             type: 'npm'
           }));
 
-          // Framework detection
           if (dependencies.some(d => d.name === 'react')) framework = 'React';
           else if (dependencies.some(d => d.name === 'vue')) framework = 'Vue';
           else if (dependencies.some(d => d.name === '@angular/core')) framework = 'Angular';
           else if (dependencies.some(d => d.name === 'next')) framework = 'Next.js';
           else if (dependencies.some(d => d.name === 'express')) framework = 'Express';
 
-          // Package manager detection
           if (allFiles.some(f => f.path.endsWith('yarn.lock'))) packageManager = 'yarn';
           else if (allFiles.some(f => f.path.endsWith('pnpm-lock.yaml'))) packageManager = 'pnpm';
           else if (allFiles.some(f => f.path.endsWith('package-lock.json'))) packageManager = 'npm';
@@ -759,7 +689,6 @@ Focus on:
       }
     }
 
-    // Step 5: Get language distribution
     const languages: Record<string, number> = {}
     allFiles.forEach(file => {
       const ext = path.extname(file.path).toLowerCase()
@@ -769,11 +698,9 @@ Focus on:
       }
     })
 
-    // Step 6: Detect default branch
     try {
       const gitStatusResult = await this.sandbox.callTool('git_status', { repoPath: '.' });
       if (gitStatusResult.success && gitStatusResult.data) {
-        // Extract branch info from git status output
         const output = gitStatusResult.data;
         if (typeof output === 'string') {
           const branchMatch = output.match(/CURRENT_BRANCH:\s*(\w+)/);
@@ -796,7 +723,6 @@ Focus on:
       framework,
       packageManager,
         projectRoot,
-      // Add new intelligent analysis fields
       projectType: intelligentAnalysis.projectType,
       backendFiles: intelligentAnalysis.backendFiles,
       frontendFiles: intelligentAnalysis.frontendFiles,
@@ -868,7 +794,6 @@ Focus on:
     const structure: Record<string, any> = {};
     const rootDirs = new Set(files.map(f => f.path.split('/')[0]));
     
-    // Limit to a reasonable number of root directories to keep summary small
     const relevantDirs = Array.from(rootDirs).filter(d => 
         !d.startsWith('.') && !['node_modules', 'dist', 'build'].includes(d)
     ).slice(0, 10);
@@ -879,18 +804,14 @@ Focus on:
     };
   }
 
-  /**
-   * Create implementation plan using intelligent analysis
-   */
   private async *createPlan(prompt: string, analysis: RepositoryAnalysis, allFiles: FileInfo[]): AsyncGenerator<StreamEvent, ImplementationPlan> {
     yield { type: 'plan', message: 'Creating implementation plan...', timestamp: new Date().toISOString() }
     console.log('[AGENT] Creating plan for prompt:', prompt)
     
-    // Determine if this is a backend-focused request
     const isBackendFocused = prompt.toLowerCase().includes('backend') || 
-                            prompt.toLowerCase().includes('server') ||
-                            prompt.toLowerCase().includes('api') ||
-                            prompt.toLowerCase().includes('database');
+                           prompt.toLowerCase().includes('server') ||
+                           prompt.toLowerCase().includes('api') ||
+                           prompt.toLowerCase().includes('database');
 
     const isFrontendFocused = prompt.toLowerCase().includes('frontend') || 
                              prompt.toLowerCase().includes('ui') ||
@@ -901,7 +822,6 @@ Focus on:
     const focusHint = isBackendFocused ? '🎯 BACKEND-FOCUSED REQUEST: Prioritize server-side files and logic' : 
                      isFrontendFocused ? '🎯 FRONTEND-FOCUSED REQUEST: Prioritize client-side files and UI' : '';
 
-    // Context-aware planning prompt
     const planningPrompt = `You are an AI coding assistant. Analyze the repository and create an implementation plan.
 
 Repository Context:
@@ -939,7 +859,6 @@ Do NOT use nested objects like "implementation_plan" or "backend"/"frontend" - u
       const aiResult = planResult.content || '';
       console.log('[AGENT] AI planning result:', aiResult.slice(0, 500));
 
-      // Enhanced plan parsing with better extraction
       const jsonMatch = aiResult.match(/```json\s*([\s\S]+?)\s*```/) || aiResult.match(/\{[\s\S]*\}/);
       if (!jsonMatch || jsonMatch.length < 1) {
         console.error('[AGENT] AI response did not contain valid JSON. Raw response:', aiResult);
@@ -955,7 +874,6 @@ Do NOT use nested objects like "implementation_plan" or "backend"/"frontend" - u
         
         console.log('[AGENT] Parsed plan structure:', JSON.stringify(aiPlan, null, 2).slice(0, 500));
         
-        // Enhanced file extraction from nested structures
         if (aiPlan.steps && Array.isArray(aiPlan.steps) && (!aiPlan.filesToModify || aiPlan.filesToModify.length === 0)) {
           aiPlan.filesToModify = [];
           aiPlan.steps.forEach((step: any) => {
@@ -970,7 +888,6 @@ Do NOT use nested objects like "implementation_plan" or "backend"/"frontend" - u
           console.log('[AGENT] Extracted files from steps:', aiPlan.filesToModify);
         }
 
-        // Intelligent fallback based on task context
         if (!aiPlan.filesToModify || aiPlan.filesToModify.length === 0) {
           if (isBackendFocused && analysis.backendFiles && analysis.backendFiles.length > 0) {
             aiPlan.filesToModify = analysis.backendFiles.slice(0, 3);
@@ -986,13 +903,11 @@ Do NOT use nested objects like "implementation_plan" or "backend"/"frontend" - u
         throw new Error('Failed to parse the AI-generated implementation plan.');
       }
 
-      // Validate the plan has actionable steps
       if (!aiPlan.filesToModify || (aiPlan.filesToModify.length === 0 && (!aiPlan.newFiles || aiPlan.newFiles.length === 0))) {
         console.error('[AGENT] AI returned an empty or invalid plan:', aiPlan);
         throw new Error('AI planner returned an empty plan. There are no files to modify or create.');
       }
 
-      // Generate final plan
       const plan: ImplementationPlan = {
         approach: aiPlan.approach || 'Implement requested changes',
         filesToModify: aiPlan.filesToModify || [],
@@ -1016,7 +931,6 @@ Do NOT use nested objects like "implementation_plan" or "backend"/"frontend" - u
       console.error('[AGENT] Planning failed:', error);
       yield { type: 'plan', message: 'Created fallback plan due to planning error.', timestamp: new Date().toISOString() }
       
-      // Enhanced fallback plan with intelligent context
       const plan: ImplementationPlan = {
         approach: `Implement: ${prompt}`,
         filesToModify: [],
@@ -1027,7 +941,6 @@ Do NOT use nested objects like "implementation_plan" or "backend"/"frontend" - u
         technologies: analysis.primaryLanguages || []
       };
       
-      // Smart fallback based on context and available files
       if (isBackendFocused && analysis.backendFiles && analysis.backendFiles.length > 0) {
         plan.filesToModify = analysis.backendFiles.slice(0, 3);
         console.log('[AGENT] Created fallback plan with backend files:', plan.filesToModify);
@@ -1035,7 +948,6 @@ Do NOT use nested objects like "implementation_plan" or "backend"/"frontend" - u
         plan.filesToModify = analysis.frontendFiles.slice(0, 3);
         console.log('[AGENT] Created fallback plan with frontend files:', plan.filesToModify);
       } else {
-        // Default fallback - use key files
         plan.filesToModify = analysis.keyFiles?.slice(0, 3) || [];
       }
       
@@ -1043,9 +955,6 @@ Do NOT use nested objects like "implementation_plan" or "backend"/"frontend" - u
     }
   }
 
-  /**
-   * Implement the plan by modifying files
-   */
   private async *implementPlan(
     plan: ImplementationPlan, 
     prompt: string,
@@ -1057,7 +966,6 @@ Do NOT use nested objects like "implementation_plan" or "backend"/"frontend" - u
     console.log('[AGENT] Implementing plan:', { filesToModify: plan.filesToModify, newFiles: plan.newFiles })
 
     try {
-      // Use autonomous implementation with direct tool access
       yield* this.implementWithTools(plan, prompt)
       
       yield { type: 'implement', message: 'Implementation plan execution completed', timestamp: new Date().toISOString() }
@@ -1069,14 +977,10 @@ Do NOT use nested objects like "implementation_plan" or "backend"/"frontend" - u
     }
   }
 
-  /**
-   * Implement the plan using autonomous LLM tool calling
-   */
   private async *implementWithTools(plan: ImplementationPlan, prompt: string): AsyncGenerator<StreamEvent> {
     yield { type: 'implement', message: 'Starting autonomous implementation with direct tool access...', timestamp: new Date().toISOString() }
     yield { type: 'implement', message: 'Executing autonomous implementation...', timestamp: new Date().toISOString() }
     
-    // Create a system prompt that explains the current state and available tools
     const systemPrompt = `You are an AI coding assistant with access to a sandbox environment. 
 You are currently in a Git repository that has been cloned to the current directory.
 The repository is on branch 'codepilot/${Date.now()}' and you need to implement changes based on the user's request.
@@ -1105,7 +1009,6 @@ You have access to these tools: list_files, read_file, write_file, git_add, git_
 
 Start by listing files to understand the structure, then read and modify the relevant files.`
 
-    // Execute the implementation with tools
     try {
       const result = await this.openai.executeWithTools(
         systemPrompt,
@@ -1135,20 +1038,15 @@ Start by listing files to understand the structure, then read and modify the rel
     }
   }
 
-  /**
-   * Validates if generated code is clean (no markdown, no explanations)
-   */
   private validateGeneratedCode(code: string, filePath: string): { isValid: boolean; issues: string[] } {
     console.log('[AGENT] Validating generated code for:', filePath)
     
     const issues: string[] = []
     
-    // Check for markdown code blocks
     if (code.includes('```')) {
       issues.push('Contains markdown code blocks')
     }
     
-    // Check for explanatory text patterns
     const explanationPatterns = [
       /^To.*?code.*?:/i,
       /^Here.*?code.*?:/i,
@@ -1168,7 +1066,6 @@ Start by listing files to understand the structure, then read and modify the rel
       }
     }
     
-    // Check if code starts with explanatory text instead of actual code
     const trimmedCode = code.trim()
     const codeStartPatterns = [
       /^import\s/,
@@ -1180,11 +1077,11 @@ Start by listing files to understand the structure, then read and modify the rel
       /^class\s/,
       /^interface\s/,
       /^type\s/,
-      /^<\w+/, // HTML/JSX
-      /^\/\*/, // CSS comment
-      /^\.[a-zA-Z]/, // CSS class
-      /^#[a-zA-Z]/, // CSS ID
-      /^\w+\s*{/ // Object or function
+      /^<\w+/, 
+      /^\/\*/, 
+      /^\.[a-zA-Z]/, 
+      /^#[a-zA-Z]/, 
+      /^\w+\s*{/ 
     ]
     
     const startsWithCode = codeStartPatterns.some(pattern => pattern.test(trimmedCode))
@@ -1216,14 +1113,12 @@ Start by listing files to understand the structure, then read and modify the rel
     console.log('[AGENT] OpenAI generated code preview:', generatedCode.slice(0, 100))
     console.log('[AGENT] Generated code length:', generatedCode.length)
 
-    // Validate the generated code
     const validation = this.validateGeneratedCode(generatedCode, filePath)
     
     if (!validation.isValid && retryCount < MAX_RETRIES) {
       console.log(`[AGENT] Generated code is invalid (attempt ${retryCount + 1}/${MAX_RETRIES + 1}). Issues:`, validation.issues)
       console.log('[AGENT] Retrying with more specific instructions...')
       
-      // Retry with more specific instructions
       const retryDescription = `${description}\n\nIMPORTANT: Generate ONLY clean executable code. Do NOT include markdown, explanations, or comments about the task. Return only the actual code that should be in the file.`
       
       yield* this.modifyFile(filePath, existingContent, retryDescription, retryCount + 1)
@@ -1262,7 +1157,6 @@ Start by listing files to understand the structure, then read and modify the rel
     const { owner, repo } = this.parseRepoUrl(repoUrl)
     
     try {
-      // Get repository info to get the actual default branch
       let actualBaseBranch = baseBranch
       
       try {
@@ -1297,9 +1191,6 @@ Start by listing files to understand the structure, then read and modify the rel
     return { owner: match[1], repo: match[2].replace('.git', '') }
   }
 
-  /**
-   * Run a tool and emit events for it
-   */
   private async runTool<T extends ToolName>(
     toolName: T, 
     params: ToolParameters[T],
@@ -1307,7 +1198,6 @@ Start by listing files to understand the structure, then read and modify the rel
   ): Promise<ToolResult> {
     const startTime = Date.now()
     
-    // Emit tool call started event
     const callEvent: StreamEvent = {
       type: 'tool_call',
       message: `Executing ${toolName}...`,
@@ -1324,7 +1214,6 @@ Start by listing files to understand the structure, then read and modify the rel
     try {
       const result = await this.sandbox.callTool(toolName, params)
       
-      // Emit tool call completed event
       const completedEvent: StreamEvent = {
         type: 'tool_call',
         message: successMessage || (result.success ? `${toolName} completed successfully.` : `${toolName} failed: ${result.error}`),
@@ -1337,7 +1226,6 @@ Start by listing files to understand the structure, then read and modify the rel
         }
       }
       
-      // Emit debug event with timing info
       const debugEvent: StreamEvent = {
         type: 'debug',
         message: `Tool ${toolName} completed in ${Date.now() - startTime}ms`,
@@ -1348,7 +1236,6 @@ Start by listing files to understand the structure, then read and modify the rel
     } catch (error: any) {
       console.error(`[AGENT] Tool ${toolName} failed:`, error)
       
-      // Emit tool call failed event
       const failedEvent: StreamEvent = {
         type: 'tool_call',
         message: `${toolName} failed: ${error.message}`,

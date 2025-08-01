@@ -23,45 +23,63 @@ Code Pilot is a sandboxed AI coding agent that can automatically generate and pr
 - **Styling**: [Tailwind CSS](https://tailwindcss.com/) with [shadcn/ui](https://ui.shadcn.com/)
 - **Package Manager**: [pnpm](https://pnpm.io/)
 
-## 🚀 Getting Started
+## 🏗️  Project Architecture
 
-Follow these steps to get the Code Pilot service running locally on your machine.
+### High-Level Flow
+1. **Frontend** (Next.js App Router)
+    • User enters a GitHub URL and a natural-language prompt.<br>  • The UI calls `POST /api/code` and streams Server-Sent Events (SSE).<br>  • While the agent works, the UI can open auxiliary pages:
+      – **/diff** – visual diff viewer  
+      – **/verification** – web terminal into the sandbox  
+      – **/ide** – in-browser file explorer + Monaco editor.
+2. **/api/code**  
+   Creates an `McpAgent`, wraps it with a LangSmith tracer and returns an SSE stream of `StreamEvent`s.
+3. **McpAgent**  
+   • Sets up an **E2B** sandbox (`/tmp/repo`).  
+   • Clones the repo (`clone_repository` tool).  
+   • Analyses the repo (LLM + tools).  
+   • Generates an implementation plan.  
+   • Calls tools (`list_files`, `read_file`, `write_file`, `git_*`) autonomously through OpenAI function-calling.  
+   • Commits, optionally pauses for verification, then opens a PR.
+4. **SandboxManager** (singleton)  
+   Keeps a map `sessionId → E2BSandbox` so all API routes (/diff, /ide, /verification) hit the **same** running container.
 
-### 1. Prerequisites
-
-- Node.js (v18 or later)
-- pnpm (or npm/yarn)
-
-### 2. Clone the Repository
-
-```bash
-git clone <repository-url>
-cd code-pilot-ui
+### Key Packages / Folders
+```
+app/                Next.js routes & pages (UI + API)
+  api/
+    code/route.ts     → POST /api/code (LLM agent)
+    diff/route.ts     → GET  /api/diff (pretty diff JSON)
+    ide/route.ts      → GET/POST /api/ide (tree + file IO)
+    publish/route.ts  → POST /api/publish (resume & push)
+    terminal/…        → WebSocket terminal bridge
+  (diff|ide|verification)/page.tsx  → Client pages
+lib/
+  llm/openai.ts      → OpenAI wrapper (function-calling, cost calc)
+  agent/…            → McpAgent + tool runner & planner
+  e2b-sandbox.ts     → Thin wrapper around E2B Code-Interpreter
+  sandbox-manager.ts → Maps sessionId → sandbox (cleans up idle)
+  terminal/session-manager.ts → Maps sessionId → node-pty process
+components/          → shadcn/ui primitives
 ```
 
-### 3. Set Up Environment Variables
+## 🔌  API Endpoints
+| Method | Path               | Purpose |
+| ------ | ------------------ | ------- |
+| POST   | `/api/code`        | Launch agent, returns **SSE** stream of `StreamEvent` objects. |
+| GET    | `/api/diff`        | JSON diff of current sandbox (`sessionId`). |
+| GET    | `/api/ide`         | `action=listFiles|readFile` tree & file IO. |
+| POST   | `/api/ide`         | `action=saveFile` write file back to sandbox. |
+| GET    | `/api/terminal/ws` | WebSocket for interactive terminal. |
+| POST   | `/api/publish`     | Resume a paused agent, push & open PR. |
 
-You'll need to create a `.env` file in the root of the project. I've also created a `.env.example` file to serve as a template.
+See `types/index.ts` for full `StreamEvent` and diff schema.
 
-```bash
-cp .env.example .env
-```
-
-Then, fill in the required API keys and tokens in your new `.env` file. See the `.env.example` file for a full list of required variables.
-
-### 4. Install Dependencies
-
-```bash
-pnpm install
-```
-
-### 5. Run the Development Server
-
-```bash
-pnpm run dev
-```
-
-The application should now be running at [http://localhost:3000](http://localhost:3000).
+## 📂  Session-based Verification Workflow
+1. Run with *Verification* enabled on the main page.  
+2. Agent pauses and emits `pause_for_verification` event with `sessionId`.  
+3. Buttons open `/diff?sessionId=x`, `/ide?sessionId=x`, `/verification?sessionId=x`.  
+4. All pages talk to the **same** sandbox via `SandboxManager`.  
+5. When satisfied, click **Publish PR** – frontend calls `/api/publish` which resumes the agent.
 
 ## 📝 API Usage
 
@@ -78,3 +96,39 @@ The primary endpoint is a POST request to `/api/code`.
 ```
 
 The API streams back Server-Sent Events (SSE) with real-time updates on the agent's progress. The frontend consumes this stream to update the UI. 
+
+## ⚙️  Environment Variables (`.env`)
+| Key | Description |
+| --- | ----------- |
+| `OPENAI_API_KEY` | Your OpenAI key (used by `lib/llm/openai.ts`). |
+| `LLM_MODEL`      | Model name (defaults to `gpt-4o`). Change to any model supported by OpenAI. |
+| `LLM_TEMPERATURE`| Sampling temperature (default 0.1). |
+| `E2B_API_KEY`    | API key for E2B Code-Interpreter sandbox. |
+| `USE_E2B_SANDBOX`| `true`/`false` – switch between E2B and local `VirtualSandbox` (for tests). |
+| `GITHUB_PERSONAL_ACCESS_TOKEN` | Token with `repo` scope to create branches & PRs. |
+| (see `.env.example` for the full list) |
+
+## 🖥️  Running Locally (Quick Start)
+```bash
+pnpm install       # or npm / yarn
+cp .env.example .env  # add your keys
+pnpm dev           # http://localhost:3000
+```
+
+## 💸  Token & Cost Tracking
+`lib/llm/openai.ts` records token usage per request and multiplies it by the pricing table in `.env → LLM_COST_PER_1K_TOKENS`.  
+Adjust the JSON if you switch models – it **does not** affect which model is used, only cost calculation.
+
+## 🧰  Tooling & Scripts
+| Script | Description |
+| ------ | ----------- |
+| `pnpm dev`   | Start Next.js in dev mode. |
+| `pnpm lint`  | ESLint + TypeScript checks. |
+| `pnpm build` | Production build. |
+| `pnpm start` | Start prod server. |
+
+## 🤝  Contributing
+PRs are welcome!  Please open an issue first to discuss changes.
+
+## 📜  License
+MIT 

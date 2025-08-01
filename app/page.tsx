@@ -553,6 +553,15 @@ export default function CodePilotUI() {
                                 <FileCode className="w-3 h-3 mr-2" />
                                 View Diff
                               </Button>
+                               <Button
+                                variant="outline"
+                                size="sm"
+                                className="border-green-500 text-green-400 bg-transparent hover:bg-green-500/10"
+                                onClick={() => window.open(`/ide?sessionId=${verificationData.sessionId}`, '_blank')}
+                              >
+                                <Code className="w-3 h-3 mr-2" />
+                                Code IDE
+                              </Button>
                             </div>
 
                             <Button
