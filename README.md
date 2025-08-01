@@ -1,5 +1,7 @@
 # Code Pilot 🚀
 
+Deployed Link - [Code Pilot](https://code-pilot-y8m7.vercel.app/)
+
 Code Pilot is a sandboxed AI coding agent that can automatically generate and propose code changes to a GitHub repository by creating a pull request based on a natural language prompt.
 
 *Note: A screenshot of the UI will be added here soon.*
