@@ -14,9 +14,10 @@ import { E2BSandbox } from './e2b-sandbox'
 import { SandboxManager } from './sandbox-manager'
 import { OpenAIClient } from './llm/openai'
 import { createPullRequestFromRepo } from './github/api'
-import { get } from '@/lib/config/env'
+import { get, getGitHubToken } from '@/lib/config/env'
 import * as path from 'path'
 import { githubAPI } from './github/api'
+import { parseGitHubUrl } from '@/lib/utils/file-ops'
 import { CodePilotError, ValidationError } from '@/lib/errors'
 
 export class McpAgent {
@@ -332,8 +333,34 @@ export class McpAgent {
       const sandbox = await SandboxManager.getInstance().getSandbox(this.sessionId)
       this.sandbox = sandbox
 
+      let repoToPushTo = this.repoUrl;
+      const parsedUrl = parseGitHubUrl(repoToPushTo);
+      if (!parsedUrl) {
+        throw new ValidationError('Invalid GitHub repository URL');
+      }
+
+      const repoData = await githubAPI.getRepository(parsedUrl.owner, parsedUrl.repo);
+      if (!repoData.permissions?.push) {
+        yield { type: 'progress', message: `No write access to ${this.repoUrl}. Forking...`, timestamp: new Date().toISOString(), progress: 88 };
+        const forkResult = await githubAPI.forkRepository(parsedUrl.owner, parsedUrl.repo);
+        repoToPushTo = forkResult.clone_url;
+
+        const token = getGitHubToken();
+        if (!token) {
+          throw new Error('GitHub token is required to push to a forked repository.');
+        }
+        
+        const authedUrl = `https://${token}@${repoToPushTo.substring('https://'.length)}`;
+
+        // Update the remote URL in the sandbox
+        await this.runTool('execute_shell', { command: `git remote set-url origin ${authedUrl}` });
+        
+        yield { type: 'progress', message: `Successfully forked. Pushing to ${forkResult.full_name}.`, timestamp: new Date().toISOString(), progress: 90 };
+      } else {
+        yield { type: 'progress', message: 'Pushing changes to GitHub...', timestamp: new Date().toISOString(), progress: 90 };
+      }
+
       console.log('[AGENT] Pushing changes to remote...')
-      yield { type: 'progress', message: 'Pushing changes to GitHub...', timestamp: new Date().toISOString(), progress: 90 }
       
       const pushResult = await this.runTool('git_push', {
         branchName
@@ -355,7 +382,8 @@ export class McpAgent {
           branchName,
           this.defaultBranch,
           title,
-          body
+          body,
+          repoToPushTo !== this.repoUrl
         )
         
         yield { type: 'pr_created', message: `Pull request created: ${prUrl}`, timestamp: new Date().toISOString(), data: { url: prUrl } }
@@ -1151,16 +1179,26 @@ Start by listing files to understand the structure, then read and modify the rel
     return content
   }
 
-  private async createPullRequest(repoUrl: string, branchName: string, baseBranch: string, title: string, body: string): Promise<string> {
+  private async createPullRequest(repoUrl: string, branchName: string, baseBranch: string, title: string, body: string, isFork: boolean = false): Promise<string> {
     console.log('[AGENT] Creating pull request...');
 
-    const { owner, repo } = this.parseRepoUrl(repoUrl)
+    const parsedRepo = this.parseRepoUrl(repoUrl);
+    let headBranch = branchName;
+
+    if (isFork) {
+      const currentUser = await githubAPI.validateToken();
+      if (currentUser?.login) {
+        headBranch = `${currentUser.login}:${branchName}`;
+      } else {
+        throw new Error("Could not determine current user's login to create PR from fork.");
+      }
+    }
     
     try {
       let actualBaseBranch = baseBranch
       
       try {
-        const repoInfo = await githubAPI.getRepository(owner, repo)
+        const repoInfo = await githubAPI.getRepository(parsedRepo.owner, parsedRepo.repo)
         if (repoInfo && repoInfo.defaultBranch) {
           actualBaseBranch = repoInfo.defaultBranch
           console.log(`[AGENT] Using repository's default branch: ${actualBaseBranch}`)
@@ -1173,7 +1211,7 @@ Start by listing files to understand the structure, then read and modify the rel
         repoUrl,
         title,
         body,
-        branchName,
+        headBranch,
         actualBaseBranch
       )
 
@@ -1186,9 +1224,11 @@ Start by listing files to understand the structure, then read and modify the rel
   }
 
   private parseRepoUrl(url: string): { owner: string; repo: string } {
-    const match = url.match(/github\.com\/([^/]+)\/([^/]+)/)
-    if (!match) throw new Error('Invalid GitHub repository URL')
-    return { owner: match[1], repo: match[2].replace('.git', '') }
+    const parsed = parseGitHubUrl(url);
+    if (!parsed) {
+      throw new Error('Invalid GitHub repository URL');
+    }
+    return parsed;
   }
 
   private async runTool<T extends ToolName>(

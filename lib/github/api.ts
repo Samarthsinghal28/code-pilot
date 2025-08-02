@@ -91,11 +91,46 @@ class GitHubAPIManager {
         createdAt: response.data.created_at,
         updatedAt: response.data.updated_at,
         cloneUrl: response.data.clone_url,
-        htmlUrl: response.data.html_url
+        htmlUrl: response.data.html_url,
+        permissions: response.data.permissions
       }
     } catch (error) {
       console.error(`Failed to get repository ${owner}/${repo}:`, error)
       throw new Error(`Failed to get repository: ${error instanceof Error ? error.message : 'Unknown error'}`)
+    }
+  }
+
+  public async forkRepository(owner: string, repo: string): Promise<any> {
+    if (!this.isAuthenticated()) {
+      throw new Error('GitHub API not authenticated');
+    }
+
+    try {
+      console.log(`Forking repository ${owner}/${repo}...`);
+      const response = await this.octokit!.rest.repos.createFork({
+        owner,
+        repo,
+      });
+      console.log(`Successfully forked repository to ${response.data.full_name}`);
+      
+      // It can take a few seconds for the fork to be available
+      // We will add a short delay and then check for availability
+      await new Promise(resolve => setTimeout(resolve, 5000));
+
+      // Verify the fork is ready
+      try {
+        await this.getRepository(response.data.owner.login, response.data.name);
+        console.log(`Fork is available at ${response.data.full_name}`);
+        return response.data;
+      } catch (e) {
+        console.warn(`Fork not immediately available, waiting a bit longer...`);
+        await new Promise(resolve => setTimeout(resolve, 10000));
+        return await this.getRepository(response.data.owner.login, response.data.name);
+      }
+
+    } catch (error) {
+      console.error(`Failed to fork repository ${owner}/${repo}:`, error);
+      throw new Error(`Failed to fork repository: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
   }
 
